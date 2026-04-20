@@ -1,0 +1,6 @@
+archivo,estado,motivo,distancia_centroide,z_score_distancia,duracion_util_s,rms_util,clipping_ratio,num_frames_validas,porcentaje_frames_validas,error_lpc_medio
+sigue_10.wav,bueno,apto técnico y cercano al centroide,0.064297,-0.290948,0.47,0.05158,0.00025,57,1.0,0.024721
+sigue_14.wav,revisar,algo alejado del centroide,0.087004,1.898623,0.55,0.047435,0.000438,67,1.0,0.020407
+sigue_3.wav,bueno,apto técnico y cercano al centroide,0.063876,-0.331589,0.542,0.042321,6.2e-05,66,1.0,0.027631
+sigue_7.wav,bueno,apto técnico y cercano al centroide,0.056139,-1.077606,0.534,0.043525,0.00025,65,1.0,0.022407
+sigue_8.wav,bueno,apto técnico y cercano al centroide,0.065256,-0.198481,0.502,0.045415,6.2e-05,61,1.0,0.023112

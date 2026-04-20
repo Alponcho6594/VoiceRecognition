@@ -1,0 +1,11 @@
+real\pred,alto,busca,camion,carga,deja,inicio,mapa,pausa,ruta,sigue
+alto,5,0,0,0,0,0,0,0,0,0
+busca,0,5,0,0,0,0,0,0,0,0
+camion,0,0,5,0,0,0,0,0,0,0
+carga,0,0,0,5,0,0,0,0,0,0
+deja,0,0,0,0,5,0,0,0,0,0
+inicio,0,0,0,0,0,5,0,0,0,0
+mapa,0,0,0,0,0,0,5,0,0,0
+pausa,0,0,0,0,0,0,0,5,0,0
+ruta,0,0,0,0,0,0,0,0,5,0
+sigue,0,0,0,0,0,0,0,0,0,5
