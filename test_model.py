@@ -1,58 +1,72 @@
 import os
 import glob
 import csv
+import json
 import numpy as np
 from scipy.io import wavfile
+from scipy.fftpack import dct
 
 # =========================================================
 # CONFIGURACIÓN GENERAL DEL PROYECTO
 # =========================================================
 
-# Lista de palabras que formarán las clases del sistema.
-# Cada palabra tendrá su propio conjunto de grabaciones y su propio codebook.
+# IMPORTANTE:
+# Esta lista debe coincidir exactamente con las palabras usadas en entrenamiento.
+# Si tu proyecto es de 5 palabras, la matriz de confusión será 5x5.
 PALABRAS = [
-    "alto", "busca", "camion", "carga", "deja",
-    "inicio", "mapa", "pausa", "ruta", "sigue"
+    "alto", "busca", "carga", "trailer", "arranca"
 ]
 
-# Orden del modelo LPC.
-# La práctica pide usar LPC de orden 12.
-ORDEN_LPC = 12
+# Deben coincidir con el entrenamiento
+N_MFCC = 13
+N_FFT = 512
+N_FILTROS_MEL = 26
+CODEBOOK_SIZE = 256
+NUM_SIMBOLOS = 256
 
-# Tamaños de codebook a probar.
-# La práctica pide investigar con 16, 32 y 64 codevectors.
-CODEBOOK_SIZES = [16, 32, 64]
-
-# Coeficiente del filtro de preénfasis.
-# Implementa H(z) = 1 - 0.95 z^-1
+# Audio
 ALPHA_PRENFASIS = 0.95
-
-# Longitud de cada trama.
-# 320 muestras a 16 kHz equivalen a 20 ms.
 FRAME_LENGTH = 320
-
-# Corrimiento entre tramas.
-# 128 muestras equivalen a 8 ms.
 HOP_LENGTH = 128
-
-# Factores para construir los umbrales de energía y ZCR.
-# Se multiplican por el valor máximo encontrado en cada archivo.
 ENERGY_FACTOR = 0.03
 ZCR_FACTOR = 0.08
-
-# Margen adicional al recorte de voz, en milisegundos.
-# Se agrega un poco antes y después para no cortar bruscamente la palabra.
 MARGEN_MS = 65
 
-# Tolerancia relativa para detener el entrenamiento del LBG.
-# Si la distorsión cambia muy poco, se considera que ya convergió.
-TOL_REL = 1e-5
+# Modelos guardados por el entrenamiento
+CARPETA_MODELOS = "modelos_hmm_mfcc_vq"
+CARPETA_HMM = os.path.join(CARPETA_MODELOS, "hmm")
+RUTA_CODEBOOK = os.path.join(CARPETA_MODELOS, "codebook_mfcc_256.npz")
 
-# Número máximo de iteraciones del algoritmo LBG.
-MAX_ITER_LBG = 50
+# Salidas de prueba
+ARCHIVO_MATRIZ = "matriz_confusion_mfcc_hmm_forward.csv"
+ARCHIVO_REPORTE = "reporte_test_mfcc_hmm_forward.csv"
+ARCHIVO_RESUMEN = "resumen_test_mfcc_hmm_forward.json"
 
-# Pequeña perturbación usada al dividir centroides en LBG.
-DELTA_SPLIT = 0.0001
+# Entregables de verificación
+ARCHIVO_VERIFICACION_A = "verificacion_diagonalidad_A.csv"
+ARCHIVO_VERIFICACION_B = "verificacion_sparsity_B_estado1.csv"
+ARCHIVO_VERIFICACION_JSON = "verificacion_modelos_hmm.json"
+
+# Forward log
+LOG_ZERO = -1e300
+
+
+# =========================================================
+# UTILIDADES
+# =========================================================
+
+def convertir_a_json_serializable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: convertir_a_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convertir_a_json_serializable(x) for x in obj]
+    return obj
 
 
 # =========================================================
@@ -60,78 +74,43 @@ DELTA_SPLIT = 0.0001
 # =========================================================
 
 def cargar_audio(ruta_audio):
-    """
-    Lee un archivo WAV y lo prepara para el procesamiento.
-
-    Qué hace:
-    1. Lee el archivo.
-    2. Si tiene dos canales, lo convierte a mono.
-    3. Lo convierte a float32.
-    4. Normaliza la amplitud.
-    5. Elimina el valor medio.
-    """
     fs, audio = wavfile.read(ruta_audio)
 
-    # Si el audio es estéreo, promedia ambos canales para trabajar en mono.
     if len(audio.shape) == 2:
         audio = np.mean(audio, axis=1)
         print(f"[INFO] Audio convertido a mono: {ruta_audio}")
 
-    # Convertimos a punto flotante para evitar problemas en operaciones posteriores.
     audio = audio.astype(np.float32)
 
-    # Normalización de amplitud.
-    # Esto ayuda a que distintas grabaciones tengan una escala comparable.
-    max_val = np.max(np.abs(audio))
+    max_val = np.max(np.abs(audio)) if len(audio) > 0 else 0.0
     if max_val > 0:
         audio = audio / max_val
 
-    # Quitamos la componente DC.
-    # Es decir, centramos la señal alrededor de cero.
-    audio = audio - np.mean(audio)
-
+    audio = audio - np.mean(audio) if len(audio) > 0 else audio
     return fs, audio
 
 
 def aplicar_preenfasis(audio, alpha=0.95):
-    """
-    Aplica el filtro de preénfasis.
+    if len(audio) == 0:
+        return audio
 
-    Fórmula:
-        y[n] = x[n] - alpha * x[n-1]
-    """
     audio_pre = np.empty_like(audio)
-
-    # La primera muestra no tiene muestra anterior.
     audio_pre[0] = audio[0]
-
-    # Aplicamos la ecuación del filtro a partir de la segunda muestra.
     audio_pre[1:] = audio[1:] - alpha * audio[:-1]
-
     return audio_pre
 
 
 def dividir_en_tramas(audio, frame_length=320, hop_length=128):
-    """
-    Divide el audio en tramas o bloques.
-
-    Si la señal es más corta que una trama completa, se rellena con ceros.
-    """
     num_samples = len(audio)
 
-    # Si el audio es muy corto, lo rellenamos para formar una sola trama.
     if num_samples < frame_length:
         padded = np.zeros(frame_length, dtype=audio.dtype)
         padded[:num_samples] = audio
         return padded[np.newaxis, :]
 
-    # Número de tramas completas que caben con el salto definido.
     num_frames = 1 + (num_samples - frame_length) // hop_length
-
-    # Matriz donde cada fila será una trama.
     frames = np.zeros((num_frames, frame_length), dtype=audio.dtype)
 
-    # Extraemos cada bloque.
     for i in range(num_frames):
         start = i * hop_length
         end = start + frame_length
@@ -141,81 +120,48 @@ def dividir_en_tramas(audio, frame_length=320, hop_length=128):
 
 
 def crear_ventana_hamming(N=320):
-    """
-    Genera una ventana de Hamming de longitud N.
-    """
     n = np.arange(N)
     w = 0.54 - 0.46 * np.cos((2 * np.pi * n) / (N - 1))
     return w.astype(np.float32)
 
 
 def aplicar_ventana_hamming(frames):
-    """
-    Multiplica cada trama por una ventana de Hamming.
-    """
-    N = frames.shape[1]
-    ventana = crear_ventana_hamming(N)
-
-    # Multiplicación punto a punto entre cada trama y la ventana.
-    frames_windowed = frames * ventana
-
-    return frames_windowed, ventana
+    ventana = crear_ventana_hamming(frames.shape[1])
+    return frames * ventana, ventana
 
 
 def calcular_energia_por_trama(frames):
-    """
-    Calcula la energía promedio de cada trama.
-    """
     return np.sum(frames ** 2, axis=1) / frames.shape[1]
 
 
 def calcular_zcr_por_trama(frames):
-    """
-    Calcula la tasa de cruces por cero (ZCR) de cada trama.
-    """
     zcr = np.zeros(frames.shape[0], dtype=np.float32)
 
     for i, frame in enumerate(frames):
         signos = np.sign(frame)
+        signos[signos == 0] = 1
         crossings = np.sum(np.abs(np.diff(signos))) / 2
         zcr[i] = crossings / len(frame)
 
     return zcr
 
 
-def detectar_inicio_fin(frames, hop_length, frame_length,
-                        energy_factor=0.03, zcr_factor=0.08):
-    """
-    Detecta el inicio y el final de la voz dentro de un archivo.
-
-    Estrategia usada:
-    - Se calcula energía por trama.
-    - Se calcula ZCR por trama.
-    - Se construyen umbrales relativos.
-    - Se marca como voz una trama que supera ambos umbrales.
-    """
+def detectar_inicio_fin(frames, hop_length, frame_length, energy_factor=0.03, zcr_factor=0.08):
     energia = calcular_energia_por_trama(frames)
     zcr = calcular_zcr_por_trama(frames)
 
-    # Umbrales relativos respecto al valor máximo del archivo.
     energy_threshold = energy_factor * np.max(energia) if len(energia) > 0 else 0.0
     zcr_threshold = zcr_factor * np.max(zcr) if len(zcr) > 0 else 0.0
 
-    # Se considera voz si una trama supera ambos umbrales.
-    voice_flags = (zcr > zcr_threshold) & (energia > energy_threshold)
+    voice_flags = (energia > energy_threshold) & (zcr > zcr_threshold)
+    voice_idx = np.where(voice_flags)[0]
 
-    # Buscamos tramas marcadas como voz.
-    first_voice_frame = np.where(voice_flags)[0]
-
-    # Si no se detectó ninguna, devolvemos None.
-    if len(first_voice_frame) == 0:
+    if len(voice_idx) == 0:
         return None, None, energia, zcr, voice_flags, energy_threshold, zcr_threshold
 
-    # Primera y última trama con voz.
-    inicio_frame = first_voice_frame[0]
-    fin_frame = first_voice_frame[-1]
+    inicio_frame = voice_idx[0]
+    fin_frame = voice_idx[-1]
 
-    # Convertimos índices de trama a índices de muestra.
     start_sample = inicio_frame * hop_length
     end_sample = fin_frame * hop_length + frame_length
 
@@ -223,347 +169,90 @@ def detectar_inicio_fin(frames, hop_length, frame_length,
 
 
 def recortar_audio(audio, start_sample, end_sample):
-    """
-    Recorta la señal entre el inicio y el final detectados.
-    """
     if start_sample is None or end_sample is None:
         return None
-
     end_sample = min(end_sample, len(audio))
     return audio[start_sample:end_sample]
 
 
 # =========================================================
-# AUTOCORRELACIÓN Y LPC
+# MFCC
 # =========================================================
 
-def autocorrelacion_corta(frame, order=12):
-    """
-    Calcula la autocorrelación corta de una trama.
-    Después de aplicar la ventana, se obtiene la función de autocorrelación
-    y a partir de ella se calculan los coeficientes LPC.
-    """
-    r = np.zeros(order + 1, dtype=np.float64)
+def hz_to_mel(hz):
+    return 2595.0 * np.log10(1.0 + hz / 700.0)
 
-    for k in range(order + 1):
-        r[k] = np.sum(frame[:len(frame) - k] * frame[k:])
 
-    return r
+def mel_to_hz(mel):
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
 
-def levinson_durbin(r, order=12):
-    """
-    Implementa el algoritmo recursivo de Levinson-Durbin.
-    """
-    # Vector de coeficientes LPC.
-    # a[0] se fija en 1 por convención.
-    a = np.zeros(order + 1, dtype=np.float64)
-    a[0] = 1.0
+def crear_banco_mel(fs, n_fft=512, n_filters=26, fmin=0.0, fmax=None):
+    if fmax is None:
+        fmax = fs / 2.0
 
-    # Error inicial igual a r[0].
-    e = r[0]
+    mel_min = hz_to_mel(fmin)
+    mel_max = hz_to_mel(fmax)
+    mel_points = np.linspace(mel_min, mel_max, n_filters + 2)
+    hz_points = mel_to_hz(mel_points)
 
-    # Si la energía es casi cero, devolvemos el vector trivial.
-    if e <= 1e-12:
-        return a, e
+    bins = np.floor((n_fft + 1) * hz_points / fs).astype(int)
+    bins = np.clip(bins, 0, n_fft // 2)
 
-    # Construcción recursiva del predictor.
-    for i in range(1, order + 1):
-        suma = 0.0
+    filterbank = np.zeros((n_filters, n_fft // 2 + 1), dtype=np.float64)
 
-        # Parte acumulada de la recursión.
-        for j in range(1, i):
-            suma += a[j] * r[i - j]
+    for m in range(1, n_filters + 1):
+        left = bins[m - 1]
+        center = bins[m]
+        right = bins[m + 1]
 
-        # Coeficiente de reflexión.
-        k = (r[i] - suma) / e
+        if center <= left:
+            center = left + 1
+        if right <= center:
+            right = center + 1
+        right = min(right, n_fft // 2)
 
-        # Actualización temporal de coeficientes.
-        a_new = a.copy()
-        a_new[i] = k
+        for k in range(left, min(center, n_fft // 2 + 1)):
+            filterbank[m - 1, k] = (k - left) / max(center - left, 1)
 
-        for j in range(1, i):
-            a_new[j] = a[j] - k * a[i - j]
+        for k in range(center, min(right, n_fft // 2 + 1)):
+            filterbank[m - 1, k] = (right - k) / max(right - center, 1)
 
-        a = a_new
+    return filterbank
 
-        # Actualización del error.
-        e = (1.0 - k * k) * e
 
-        # Evitamos que el error se vuelva numéricamente inestable.
-        if e <= 1e-12:
-            e = 1e-12
-            break
+def extraer_mfcc_por_trama(frames_hamming, fs, n_mfcc=13, n_fft=512, n_filters=26):
+    spectrum = np.fft.rfft(frames_hamming, n=n_fft)
+    power_spectrum = (1.0 / n_fft) * (np.abs(spectrum) ** 2)
 
-    return a, e
+    mel_bank = crear_banco_mel(fs, n_fft=n_fft, n_filters=n_filters)
+    mel_energies = np.dot(power_spectrum, mel_bank.T)
+    mel_energies = np.maximum(mel_energies, 1e-12)
 
+    log_mel = np.log(mel_energies)
+    mfcc = dct(log_mel, type=2, axis=1, norm="ortho")[:, :n_mfcc]
 
-def extraer_lpc_por_trama(frames_hamming, order=12):
-    """
-    Para cada trama:
-    1. calcula la autocorrelación,
-    2. obtiene los coeficientes LPC,
-    3. guarda también el error de predicción.
-    """
-    num_frames = frames_hamming.shape[0]
+    return mfcc.astype(np.float64)
 
-    lpc_vectors = np.zeros((num_frames, order + 1), dtype=np.float64)
-    r_vectors = np.zeros((num_frames, order + 1), dtype=np.float64)
-    errors = np.zeros(num_frames, dtype=np.float64)
 
-    for i in range(num_frames):
-        frame = frames_hamming[i]
-
-        # Autocorrelación de la trama.
-        r = autocorrelacion_corta(frame, order=order)
-
-        # LPC usando Levinson-Durbin.
-        a, e = levinson_durbin(r, order=order)
-
-        r_vectors[i, :] = r
-        lpc_vectors[i, :] = a
-        errors[i] = e
-
-    return lpc_vectors, r_vectors, errors
-
-
-# =========================================================
-# CONVERSIÓN ENTRE LPC Y LSF
-# =========================================================
-
-def _unique_angles_sorted(angles, tol=1e-4):
-    """
-    Ordena ángulos y elimina duplicados casi iguales.
-
-    Esto ayuda a limpiar el resultado numérico durante la conversión a LSF.
-    """
-    if len(angles) == 0:
-        return angles
-
-    angles = np.sort(angles)
-    unicos = [angles[0]]
-
-    for ang in angles[1:]:
-        if np.abs(ang - unicos[-1]) > tol:
-            unicos.append(ang)
-
-    return np.array(unicos)
-
-
-def lpc_a_lsf(a):
-    """
-    Convierte un vector LPC a LSF.
-
-    Aunque la comparación final se hace con Itakura-Saito,
-    el clustering se realiza sobre LSF, porque son más estables
-    y convenientes para el agrupamiento.
-    """
-    a = np.asarray(a, dtype=np.float64)
-
-    if a[0] == 0:
-        raise ValueError("El primer coeficiente LPC no puede ser cero.")
-
-    # Normalización para asegurar a[0] = 1.
-    a = a / a[0]
-
-    # Construcción del polinomio AR.
-    ar = np.concatenate(([1.0], -a[1:]))
-    p = len(ar) - 1
-
-    # Construcción de polinomios simétricos y antisimétricos.
-    ar_padded = np.concatenate((ar, [0.0]))
-    ar_rev = ar_padded[::-1]
-
-    P = ar_padded + ar_rev
-    Q = ar_padded - ar_rev
-
-    # División por factores fijos, como se hace en la conversión estándar.
-    P_red, _ = np.polydiv(P, np.array([1.0, 1.0]))
-    Q_red, _ = np.polydiv(Q, np.array([1.0, -1.0]))
-
-    P_red = np.real_if_close(P_red, tol=1000).astype(np.float64)
-    Q_red = np.real_if_close(Q_red, tol=1000).astype(np.float64)
-
-    # Raíces de ambos polinomios.
-    roots_P = np.roots(P_red)
-    roots_Q = np.roots(Q_red)
-
-    # Extraemos sus ángulos.
-    ang_P = np.abs(np.angle(roots_P))
-    ang_Q = np.abs(np.angle(roots_Q))
-
-    ang = np.concatenate((ang_P, ang_Q))
-
-    # Conservamos solo los ángulos válidos dentro de (0, pi).
-    eps = 1e-6
-    ang = ang[(ang > eps) & (ang < np.pi - eps)]
-
-    # Quitamos duplicados numéricos y ordenamos.
-    ang = _unique_angles_sorted(ang, tol=1e-4)
-
-    # Validación del número esperado de LSF.
-    if len(ang) < p:
-        raise ValueError(
-            f"No se pudieron obtener suficientes LSF. "
-            f"Esperadas: {p}, obtenidas: {len(ang)}"
-        )
-
-    if len(ang) > p:
-        ang = ang[:p]
-
-    return ang
-
-
-def _convolve_all(polys):
-    """
-    Convoluciona una lista de polinomios.
-    """
-    out = np.array([1.0], dtype=np.float64)
-
-    for p in polys:
-        out = np.convolve(out, p)
-
-    return out
-
-
-def _lsf_to_PQ(lsf):
-    """
-    Construye los polinomios P y Q a partir de un vector LSF.
-    """
-    lsf = np.asarray(lsf, dtype=np.float64)
-    p = len(lsf)
-
-    if p % 2 != 0:
-        raise ValueError("Esta implementación espera orden LPC par.")
-
-    # Separación de frecuencias impares y pares.
-    w_odd = lsf[0::2]
-    w_even = lsf[1::2]
-
-    P_factors = [
-        np.array([1.0, -2.0 * np.cos(w), 1.0], dtype=np.float64)
-        for w in w_odd
-    ]
-    Q_factors = [
-        np.array([1.0, -2.0 * np.cos(w), 1.0], dtype=np.float64)
-        for w in w_even
-    ]
-
-    P = _convolve_all(P_factors)
-    Q = _convolve_all(Q_factors)
-
-    P = np.convolve(P, np.array([1.0, 1.0], dtype=np.float64))
-    Q = np.convolve(Q, np.array([1.0, -1.0], dtype=np.float64))
-
-    return P, Q
-
-
-def lsf_a_lpc(lsf):
-    """
-    Convierte un vector LSF a LPC.
-
-    Esto se necesita porque el agrupamiento se hace en LSF,
-    pero la distancia Itakura-Saito se evalúa usando LPC.
-    """
-    lsf = np.asarray(lsf, dtype=np.float64)
-    lsf = np.sort(lsf)
-
-    # Validamos que estén dentro del intervalo correcto.
-    if np.any(lsf <= 0) or np.any(lsf >= np.pi):
-        raise ValueError("Los LSF deben estar estrictamente dentro de (0, pi).")
-
-    # Validamos que estén estrictamente ordenados.
-    if np.any(np.diff(lsf) <= 0):
-        raise ValueError("Los LSF deben estar estrictamente ordenados.")
-
-    p = len(lsf)
-
-    if p % 2 != 0:
-        raise ValueError("Esta implementación espera orden LPC par.")
-
-    P, Q = _lsf_to_PQ(lsf)
-
-    # Reconstrucción del polinomio A(z).
-    A = 0.5 * (P + Q)
-    A = A[:-1]
-    A = np.real_if_close(A).astype(np.float64)
-
-    if abs(A[0]) < 1e-12:
-        raise ValueError("Conversión LSF->LPC inválida: coeficiente líder cero.")
-
-    A = A / A[0]
-    return A
-
-
-def proyectar_lsf_valido(lsf, margen=1e-3):
-    """
-    Ajusta un vector LSF para que sea válido:
-    - dentro de (0, pi),
-    - ordenado,
-    - sin elementos demasiado pegados.
-
-    Esto ayuda a mantener estabilidad en el entrenamiento del codebook.
-    """
-    lsf = np.asarray(lsf, dtype=np.float64).copy()
-    lsf = np.clip(lsf, margen, np.pi - margen)
-    lsf.sort()
-
-    for i in range(1, len(lsf)):
-        if lsf[i] <= lsf[i - 1] + margen:
-            lsf[i] = lsf[i - 1] + margen
-
-    if lsf[-1] >= np.pi - margen:
-        lsf[-1] = np.pi - margen
-
-        for i in range(len(lsf) - 2, -1, -1):
-            if lsf[i] >= lsf[i + 1] - margen:
-                lsf[i] = lsf[i + 1] - margen
-
-    return lsf
-
-
-# =========================================================
-# PIPELINE COMPLETO PARA UN SOLO AUDIO
-# =========================================================
-
-def procesar_audio_a_caracteristicas(
+def procesar_audio_a_mfcc(
     ruta_audio,
     alpha=0.95,
     frame_length=320,
     hop_length=128,
-    orden_lpc=12,
+    n_mfcc=13,
+    n_fft=512,
+    n_filters=26,
     energy_factor=0.03,
     zcr_factor=0.08,
     margen_ms=65
 ):
-    """
-    Procesa un archivo completo desde audio crudo hasta vectores útiles
-    para el entrenamiento del sistema.
-
-    Flujo:
-    1. leer audio,
-    2. aplicar preénfasis,
-    3. dividir en tramas,
-    4. aplicar Hamming,
-    5. detectar voz,
-    6. recortar la palabra,
-    7. volver a tramificar la señal recortada,
-    8. obtener LPC,
-    9. convertir a LSF.
-    """
-    # Cargamos el archivo.
     fs, audio = cargar_audio(ruta_audio)
-
-    # Aplicamos preénfasis.
     audio_pre = aplicar_preenfasis(audio, alpha=alpha)
 
-    # Primera división en tramas para detectar voz.
     frames = dividir_en_tramas(audio_pre, frame_length=frame_length, hop_length=hop_length)
-
-    # Aplicamos Hamming a esas tramas.
     frames_hamming, _ = aplicar_ventana_hamming(frames)
 
-    # Detectamos inicio y fin de la palabra.
     resultado = detectar_inicio_fin(
         frames_hamming,
         hop_length=hop_length,
@@ -574,286 +263,398 @@ def procesar_audio_a_caracteristicas(
 
     start_sample, end_sample, energia, zcr, voice_flags, energy_threshold, zcr_threshold = resultado
 
-    # Si no se detectó voz, se detiene.
     if start_sample is None or end_sample is None:
         raise ValueError(f"No se detectó voz en el archivo: {ruta_audio}")
 
-    # Agregamos un margen adicional al inicio y final.
     margen = int((margen_ms / 1000.0) * fs)
     start_sample = max(0, start_sample - margen)
     end_sample = min(len(audio_pre), end_sample + margen)
 
-    # Recortamos la señal.
     audio_recortado = recortar_audio(audio_pre, start_sample, end_sample)
 
-    # Volvemos a tramificar ahora solo la región útil de voz.
     frames_rec = dividir_en_tramas(audio_recortado, frame_length=frame_length, hop_length=hop_length)
-
-    # Aplicamos nuevamente Hamming sobre la señal ya recortada.
     frames_rec_hamming, _ = aplicar_ventana_hamming(frames_rec)
 
-    # Extraemos LPC, autocorrelación y error.
-    lpc, r, errors = extraer_lpc_por_trama(frames_rec_hamming, order=orden_lpc)
+    mfcc = extraer_mfcc_por_trama(
+        frames_rec_hamming,
+        fs=fs,
+        n_mfcc=n_mfcc,
+        n_fft=n_fft,
+        n_filters=n_filters
+    )
 
-    # Convertimos cada vector LPC a LSF.
-    lsf = []
-    indices_validos = []
-
-    for i, a in enumerate(lpc):
-        try:
-            lsf_i = lpc_a_lsf(a)
-            lsf.append(lsf_i)
-            indices_validos.append(i)
-        except Exception:
-            # Si una trama falla en la conversión, se ignora.
-            continue
-
-    if len(lsf) == 0:
-        raise ValueError(f"No se pudieron obtener vectores LSF en: {ruta_audio}")
-
-    lsf = np.array(lsf, dtype=np.float64)
-    indices_validos = np.array(indices_validos, dtype=int)
-
-    # Conservamos solo las tramas válidas.
-    lpc = lpc[indices_validos]
-    r = r[indices_validos]
-    errors = errors[indices_validos]
+    if mfcc.shape[0] == 0:
+        raise ValueError(f"No se pudieron obtener MFCC en: {ruta_audio}")
 
     return {
         "ruta": ruta_audio,
         "fs": fs,
-        "lpc": lpc,
-        "r": r,
-        "errors": errors,
-        "lsf": lsf,
-        "num_frames": len(lsf)
+        "mfcc": mfcc,
+        "num_frames": int(mfcc.shape[0]),
+        "duracion_original_s": len(audio) / fs,
+        "duracion_recortada_s": len(audio_recortado) / fs,
+        "start_sample": int(start_sample),
+        "end_sample": int(end_sample),
+        "energy_threshold": float(energy_threshold),
+        "zcr_threshold": float(zcr_threshold)
     }
 
 
 # =========================================================
-# DISTANCIA ITAKURA-SAITO
+# VQ: MFCC -> ÍNDICES 0..255
 # =========================================================
 
-def ra_desde_lpc(a):
-    """
-    Calcula la autocorrelación corta del vector LPC.
-    """
-    a = np.asarray(a, dtype=np.float64)
-    P = len(a) - 1
-    ra = np.zeros(P + 1, dtype=np.float64)
+def cargar_codebook(ruta_codebook=RUTA_CODEBOOK):
+    if not os.path.exists(ruta_codebook):
+        raise FileNotFoundError(
+            f"No existe el codebook: {ruta_codebook}\n"
+            "Primero ejecuta el archivo de entrenamiento."
+        )
 
-    for i in range(P + 1):
-        ra[i] = np.sum(a[:P + 1 - i] * a[i:])
+    data = np.load(ruta_codebook, allow_pickle=True)
+    centroides = data["centroides"].astype(np.float64)
 
-    return ra
+    if centroides.shape[0] != CODEBOOK_SIZE:
+        raise ValueError(f"El codebook debe tener 256 centroides, tiene: {centroides.shape[0]}")
 
-
-def distancia_is_desde_r_y_lpc(r, a, sigma2=1.0, piso=1e-12):
-    """
-    Calcula la distancia Itakura-Saito entre:
-    - la autocorrelación de una trama de prueba,
-    - y un modelo LPC de referencia.
-    """
-    r = np.asarray(r, dtype=np.float64)
-    a = np.asarray(a, dtype=np.float64)
-
-    ra = ra_desde_lpc(a)
-    P = min(len(r), len(ra)) - 1
-
-    d = (r[0] * ra[0] + 2.0 * np.sum(r[1:P+1] * ra[1:P+1])) / max(sigma2, piso)
-    return float(d)
+    print(f"[MODELO] Codebook cargado: {ruta_codebook} | shape={centroides.shape}")
+    return centroides
 
 
-def distancia_total_audio_vs_codebook(r_vectors, centroides_lpc, sigma2_mode="frame"):
-    """
-    Compara un audio completo contra un codebook.
+def mfcc_a_indices_vq(mfcc, centroides):
+    mfcc = np.asarray(mfcc, dtype=np.float64)
+    centroides = np.asarray(centroides, dtype=np.float64)
 
-    Qué hace:
-    - para cada trama del audio de prueba,
-      calcula la distancia contra todos los centroides del codebook;
-    - toma la menor distancia de esa trama;
-    - acumula esas mínimas para obtener una distancia total;
-    - además calcula la distancia promedio por trama.
-    """
-    if len(r_vectors) == 0:
-        raise ValueError("r_vectors está vacío.")
+    distancias = np.sum((mfcc[:, None, :] - centroides[None, :, :]) ** 2, axis=2)
+    O = np.argmin(distancias, axis=1).astype(np.int64)
 
-    dist_total = 0.0
+    if np.any(O < 0) or np.any(O >= CODEBOOK_SIZE):
+        raise ValueError("La secuencia O contiene índices fuera del rango 0..255")
 
-    for i in range(r_vectors.shape[0]):
-        r = r_vectors[i]
-        sigma2 = max(r[0], 1e-12) if sigma2_mode == "frame" else 1.0
-
-        dists = [
-            distancia_is_desde_r_y_lpc(r, centroide, sigma2=sigma2)
-            for centroide in centroides_lpc
-        ]
-
-        # Se toma la distancia mínima de la trama al codebook.
-        dist_total += np.min(dists)
-
-    dist_prom = dist_total / r_vectors.shape[0]
-    return dist_total, dist_prom
+    return O
 
 
 # =========================================================
-# CARGA DE MODELOS ENTRENADOS
+# CARGA DE HMMs
 # =========================================================
 
-def cargar_modelos_desde_npz(carpeta_modelos, palabras, codebook_size):
-    """
-    Carga los modelos guardados previamente en archivos NPZ.
-
-    Cada modelo contiene:
-    - centroides en LPC,
-    - centroides en LSF,
-    - y metadatos de entrenamiento.
-    """
+def cargar_modelos_hmm(carpeta_hmm=CARPETA_HMM, palabras=PALABRAS):
     modelos = {}
 
     for palabra in palabras:
-        ruta_modelo = os.path.join(
-            carpeta_modelos,
-            f"{palabra}_codebook_{codebook_size}_is.npz"
-        )
+        ruta_modelo = os.path.join(carpeta_hmm, f"hmm_{palabra}.npz")
 
         if not os.path.exists(ruta_modelo):
-            raise FileNotFoundError(f"No existe el modelo: {ruta_modelo}")
+            raise FileNotFoundError(
+                f"No existe el HMM: {ruta_modelo}\n"
+                "Revisa que entrenaste exactamente las mismas palabras."
+            )
 
         data = np.load(ruta_modelo, allow_pickle=True)
 
-        centroides_lpc = data["centroides_lpc"]
-        centroides_lsf = data["centroides_lsf"]
+        A = data["A"].astype(np.float64)
+        B = data["B"].astype(np.float64)
+        pi = data["pi"].astype(np.float64)
+        N = int(data["N"])
+        M = int(data["M"])
+
+        if A.shape != (N, N):
+            raise ValueError(f"A inválida en {palabra}: {A.shape}")
+        if B.shape != (N, M):
+            raise ValueError(f"B inválida en {palabra}: {B.shape}")
+        if pi.shape != (N,):
+            raise ValueError(f"pi inválida en {palabra}: {pi.shape}")
+        if M != NUM_SIMBOLOS:
+            raise ValueError(f"M debe ser 256 en {palabra}, pero es {M}")
+        if not np.allclose(A.sum(axis=1), 1.0):
+            raise ValueError(f"Las filas de A no suman 1 en {palabra}")
+        if not np.allclose(B.sum(axis=1), 1.0):
+            raise ValueError(f"Las filas de B no suman 1 en {palabra}")
+        if not np.allclose(pi.sum(), 1.0):
+            raise ValueError(f"pi no suma 1 en {palabra}")
 
         modelos[palabra] = {
-            "centroides_lpc": centroides_lpc,
-            "centroides_lsf": centroides_lsf,
+            "palabra": palabra,
+            "N": N,
+            "M": M,
+            "A": A,
+            "B": B,
+            "pi": pi,
             "ruta_modelo": ruta_modelo
         }
 
-        print(f"[MODELO] {palabra} cargado desde {ruta_modelo}")
+        print(f"[MODELO] HMM cargado: {palabra:>8s} | A={A.shape} | B={B.shape} | pi={pi.shape}")
 
     return modelos
 
 
 # =========================================================
-# CLASIFICACIÓN DE UN SOLO AUDIO
+# FORWARD EN LOGARITMOS
 # =========================================================
 
-def clasificar_audio(ruta_audio, modelos, usar_promedio=True):
-    """
-    Clasifica un archivo de prueba comparándolo contra todos los modelos.
+def logsumexp(values):
+    values = np.asarray(values, dtype=np.float64)
+    vmax = np.max(values)
 
-    Qué hace:
-    1. procesa el audio de prueba,
-    2. obtiene sus vectores de autocorrelación,
-    3. calcula la distancia del audio contra cada codebook,
-    4. elige la palabra cuyo score sea mínimo.
+    if vmax <= LOG_ZERO / 2:
+        return LOG_ZERO
 
-    Nota:
-    - Si usar_promedio=True, se usa distancia promedio por trama.
-    - Si usar_promedio=False, se usa distancia total acumulada.
+    return vmax + np.log(np.sum(np.exp(values - vmax)))
+
+
+def forward_log(O, modelo):
     """
-    datos = procesar_audio_a_caracteristicas(
+    Calcula log P(O | lambda) usando Forward en espacio logarítmico.
+    La palabra reconocida es la del modelo con mayor log-likelihood.
+    """
+    O = np.asarray(O, dtype=np.int64)
+
+    A = modelo["A"]
+    B = modelo["B"]
+    pi = modelo["pi"]
+    N = modelo["N"]
+    M = modelo["M"]
+    T = len(O)
+
+    if T == 0:
+        raise ValueError("La secuencia O está vacía.")
+    if np.any(O < 0) or np.any(O >= M):
+        raise ValueError(f"O contiene símbolos fuera del rango 0..{M - 1}")
+
+    logA = np.where(A > 0, np.log(A), LOG_ZERO)
+    logB = np.where(B > 0, np.log(B), LOG_ZERO)
+    logpi = np.where(pi > 0, np.log(pi), LOG_ZERO)
+
+    alpha = np.full((T, N), LOG_ZERO, dtype=np.float64)
+
+    # Inicialización
+    alpha[0, :] = logpi + logB[:, O[0]]
+
+    # Recursión
+    for t in range(1, T):
+        obs = O[t]
+        for j in range(N):
+            valores = alpha[t - 1, :] + logA[:, j]
+            alpha[t, j] = logB[j, obs] + logsumexp(valores)
+
+    # Terminación
+    return float(logsumexp(alpha[T - 1, :]))
+
+
+def clasificar_secuencia(O, modelos_hmm):
+    scores = {}
+
+    for palabra, modelo in modelos_hmm.items():
+        scores[palabra] = forward_log(O, modelo)
+
+    prediccion = max(scores, key=scores.get)
+    return prediccion, scores
+
+
+def reconocer_audio(ruta_audio, centroides, modelos_hmm):
+    datos = procesar_audio_a_mfcc(
         ruta_audio=ruta_audio,
         alpha=ALPHA_PRENFASIS,
         frame_length=FRAME_LENGTH,
         hop_length=HOP_LENGTH,
-        orden_lpc=ORDEN_LPC,
+        n_mfcc=N_MFCC,
+        n_fft=N_FFT,
+        n_filters=N_FILTROS_MEL,
         energy_factor=ENERGY_FACTOR,
         zcr_factor=ZCR_FACTOR,
         margen_ms=MARGEN_MS
     )
 
-    r_vectors = datos["r"]
-    resultados = {}
+    O = mfcc_a_indices_vq(datos["mfcc"], centroides)
+    prediccion, scores = clasificar_secuencia(O, modelos_hmm)
 
-    for palabra_modelo, modelo in modelos.items():
-        dist_total, dist_prom = distancia_total_audio_vs_codebook(
-            r_vectors,
-            modelo["centroides_lpc"],
-            sigma2_mode="frame"
-        )
-
-        # Score final para decidir.
-        score = dist_prom if usar_promedio else dist_total
-
-        resultados[palabra_modelo] = {
-            "dist_total": dist_total,
-            "dist_prom": dist_prom,
-            "score": score
-        }
-
-    # Se elige la palabra con el menor score.
-    prediccion = min(resultados, key=lambda k: resultados[k]["score"])
-    return prediccion, resultados, datos
+    return prediccion, scores, O, datos
 
 
 # =========================================================
-# MATRIZ DE CONFUSIÓN Y REPORTES
+# ENTREGABLES DE VERIFICACIÓN
+# =========================================================
+
+def verificar_diagonalidad_A(modelos_hmm):
+    """
+    Entregable:
+    Demuestra que A es Bakis / left-to-right:
+    solo permite a_ii y a_i,i+1.
+    """
+    filas_csv = []
+    resumen = {}
+
+    print("\n====================================================")
+    print("VERIFICACIÓN: DIAGONALIDAD / BAKIS EN A")
+    print("====================================================")
+
+    for palabra, modelo in modelos_hmm.items():
+        A = modelo["A"]
+        N = modelo["N"]
+
+        mascara_permitida = np.zeros_like(A, dtype=bool)
+        for i in range(N):
+            mascara_permitida[i, i] = True
+            if i + 1 < N:
+                mascara_permitida[i, i + 1] = True
+
+        masa_permitida = float(np.sum(A[mascara_permitida]))
+        masa_prohibida = float(np.sum(A[~mascara_permitida]))
+        cumple_bakis = np.isclose(masa_prohibida, 0.0)
+
+        resumen[palabra] = {
+            "A": A,
+            "masa_permitida_diagonal_superdiagonal": masa_permitida,
+            "masa_prohibida_fuera_de_bakis": masa_prohibida,
+            "cumple_bakis": bool(cumple_bakis)
+        }
+
+        print(f"\nPalabra: {palabra}")
+        print(np.round(A, 6))
+        print(f"Masa en diagonal/superdiagonal: {masa_permitida:.6f}")
+        print(f"Masa fuera de Bakis           : {masa_prohibida:.12f}")
+        print(f"Cumple Bakis                  : {cumple_bakis}")
+
+        for i in range(N):
+            fila = {"palabra": palabra, "estado": i + 1}
+            for j in range(N):
+                fila[f"A_{i+1}_{j+1}"] = A[i, j]
+            filas_csv.append(fila)
+
+    if filas_csv:
+        columnas = ["palabra", "estado"] + [
+            f"A_{i+1}_{j+1}"
+            for i in range(next(iter(modelos_hmm.values()))["N"])
+            for j in range(next(iter(modelos_hmm.values()))["N"])
+        ]
+
+        # Para evitar muchas columnas vacías por fila, guardamos una fila por estado con todas las columnas.
+        with open(ARCHIVO_VERIFICACION_A, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=columnas)
+            writer.writeheader()
+            for fila in filas_csv:
+                writer.writerow(fila)
+
+    print(f"\n[GUARDADO] {ARCHIVO_VERIFICACION_A}")
+    return resumen
+
+
+def verificar_sparsity_B_estado1(modelos_hmm, top_k=10, umbral_casi_cero=1e-5):
+    """
+    Entregable:
+    Para el Estado 1, muestra que B tiene picos en pocos índices
+    y probabilidades casi cero en la mayoría de los 256 símbolos.
+    """
+    filas_csv = []
+    resumen = {}
+
+    print("\n====================================================")
+    print("VERIFICACIÓN: SPARSITY EN B, ESTADO 1")
+    print("====================================================")
+
+    for palabra, modelo in modelos_hmm.items():
+        B = modelo["B"]
+        b_estado1 = B[0, :]  # Estado 1, índices 0..255
+
+        indices_ordenados = np.argsort(b_estado1)[::-1]
+        top_indices = indices_ordenados[:top_k]
+
+        num_casi_cero = int(np.sum(b_estado1 <= umbral_casi_cero))
+        porcentaje_casi_cero = 100.0 * num_casi_cero / len(b_estado1)
+
+        resumen[palabra] = {
+            "top_indices_estado1": top_indices.tolist(),
+            "top_probabilidades_estado1": b_estado1[top_indices].tolist(),
+            "num_simbolos_casi_cero": num_casi_cero,
+            "porcentaje_simbolos_casi_cero": porcentaje_casi_cero,
+            "umbral_casi_cero": umbral_casi_cero
+        }
+
+        print(f"\nPalabra: {palabra}")
+        print(f"Símbolos casi cero <= {umbral_casi_cero}: {num_casi_cero}/256 ({porcentaje_casi_cero:.2f}%)")
+        print("Top índices con mayor probabilidad en B[Estado 1]:")
+        for rank, idx in enumerate(top_indices, start=1):
+            prob = float(b_estado1[idx])
+            print(f"  {rank:02d}. índice={idx:3d} | prob={prob:.10f}")
+
+            filas_csv.append({
+                "palabra": palabra,
+                "estado": 1,
+                "rank": rank,
+                "indice_vq": int(idx),
+                "probabilidad": prob,
+                "num_simbolos_casi_cero": num_casi_cero,
+                "porcentaje_simbolos_casi_cero": porcentaje_casi_cero,
+                "umbral_casi_cero": umbral_casi_cero
+            })
+
+    columnas = [
+        "palabra",
+        "estado",
+        "rank",
+        "indice_vq",
+        "probabilidad",
+        "num_simbolos_casi_cero",
+        "porcentaje_simbolos_casi_cero",
+        "umbral_casi_cero"
+    ]
+
+    with open(ARCHIVO_VERIFICACION_B, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columnas)
+        writer.writeheader()
+        for fila in filas_csv:
+            writer.writerow(fila)
+
+    print(f"\n[GUARDADO] {ARCHIVO_VERIFICACION_B}")
+    return resumen
+
+
+def guardar_verificacion_json(resumen_A, resumen_B):
+    resumen = {
+        "palabras": PALABRAS,
+        "nota": "Si el proyecto usa 5 palabras, la matriz de confusión correcta es 5x5. Si pidieran 10 palabras, cambiar PALABRAS a 10 clases.",
+        "diagonalidad_A": resumen_A,
+        "sparsity_B_estado1": resumen_B,
+        "archivo_verificacion_A": ARCHIVO_VERIFICACION_A,
+        "archivo_verificacion_B": ARCHIVO_VERIFICACION_B
+    }
+
+    with open(ARCHIVO_VERIFICACION_JSON, "w", encoding="utf-8") as f:
+        json.dump(convertir_a_json_serializable(resumen), f, indent=2, ensure_ascii=False)
+
+    print(f"[GUARDADO] {ARCHIVO_VERIFICACION_JSON}")
+
+
+# =========================================================
+# REPORTES Y MATRIZ DE CONFUSIÓN
 # =========================================================
 
 def crear_matriz_confusion(palabras):
-    """
-    Crea una matriz de confusión vacía.
-
-    Filas:
-    palabra real
-
-    Columnas:
-    palabra predicha
-    """
-    n = len(palabras)
-    return np.zeros((n, n), dtype=int)
+    return np.zeros((len(palabras), len(palabras)), dtype=int)
 
 
 def guardar_matriz_confusion_csv(matriz, palabras, ruta_csv):
-    """
-    Guarda la matriz de confusión en un archivo CSV.
-    """
     with open(ruta_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["real\\pred"] + palabras)
-
         for i, palabra_real in enumerate(palabras):
             writer.writerow([palabra_real] + list(matriz[i]))
 
 
-def guardar_reporte_csv(reporte, ruta_csv):
-    """
-    Guarda un reporte detallado de todos los audios evaluados.
-
-    El reporte incluye:
-    - archivo,
-    - clase real,
-    - clase predicha,
-    - si fue correcta o no,
-    - número de tramas,
-    - distancias contra cada modelo.
-    """
-    if len(reporte) == 0:
-        return
-
+def guardar_reporte_csv(reporte, ruta_csv, palabras):
     columnas_base = [
         "archivo",
         "real",
         "predicha",
         "correcta",
-        "num_frames"
+        "num_frames_mfcc",
+        "longitud_O",
+        "duracion_recortada_s",
+        "primeros_20_indices"
     ]
 
-    palabras_modelo = sorted(
-        [k.replace("dist_total_", "") for k in reporte[0].keys() if k.startswith("dist_total_")]
-    )
-
-    columnas_dinamicas = []
-    for p in palabras_modelo:
-        columnas_dinamicas.extend([
-            f"dist_total_{p}",
-            f"dist_prom_{p}"
-        ])
-
-    columnas = columnas_base + columnas_dinamicas
+    columnas_scores = [f"loglik_{p}" for p in palabras]
+    columnas = columnas_base + columnas_scores
 
     with open(ruta_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=columnas)
@@ -862,176 +663,208 @@ def guardar_reporte_csv(reporte, ruta_csv):
             writer.writerow(fila)
 
 
-# =========================================================
-# EVALUACIÓN PARA UN SOLO TAMAÑO DE CODEBOOK
-# =========================================================
-
-def probar_tamano_codebook(codebook_size):
-    """
-    Evalúa todos los audios de prueba para un tamaño específico de codebook.
-
-    Qué hace:
-    1. carga los modelos de ese tamaño,
-    2. recorre cada carpeta de test,
-    3. clasifica cada audio,
-    4. actualiza la matriz de confusión,
-    5. calcula el accuracy,
-    6. guarda reportes.
-    """
-    carpeta_modelos = f"modelos_codebook_{codebook_size}_is"
-    archivo_matriz = f"matriz_confusion_codebook_{codebook_size}_is.csv"
-    archivo_reporte = f"reporte_test_codebook_{codebook_size}_is.csv"
-
+def imprimir_matriz_confusion(matriz, palabras):
     print("\n====================================================")
-    print("TEST DE RECONOCIMIENTO CON CODEBOOKS LBG-IS")
+    print("MATRIZ DE CONFUSIÓN")
     print("====================================================")
-    print(f"Orden LPC      : {ORDEN_LPC}")
-    print(f"Codevectors    : {codebook_size}")
-    print(f"Palabras       : {PALABRAS}")
-    print(f"Carpeta modelos: {carpeta_modelos}")
+    print("Filas = palabra real | Columnas = predicción\n")
+
+    print("          " + "  ".join([f"{p:>8s}" for p in palabras]))
+    for i, palabra_real in enumerate(palabras):
+        fila = "  ".join([f"{matriz[i, j]:8d}" for j in range(len(palabras))])
+        print(f"{palabra_real:>8s}  {fila}")
+
+    print(f"\nTamaño de matriz: {len(palabras)}x{len(palabras)}")
+
+
+def analizar_confusiones(matriz, palabras):
+    """
+    Genera un análisis básico de confusiones.
+    El análisis fonético fino debe completarse manualmente según las palabras confundidas.
+    """
+    analisis = []
+
+    for i, palabra_real in enumerate(palabras):
+        total_real = int(np.sum(matriz[i, :]))
+        correctas = int(matriz[i, i])
+
+        for j, palabra_pred in enumerate(palabras):
+            if i != j and matriz[i, j] > 0:
+                analisis.append({
+                    "real": palabra_real,
+                    "predicha": palabra_pred,
+                    "conteo": int(matriz[i, j]),
+                    "total_real": total_real,
+                    "comentario": (
+                        "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ "
+                        "está asignando índices parecidos a regiones acústicas distintas."
+                    )
+                })
+
+        if total_real > 0 and correctas < total_real:
+            print(
+                f"[ANÁLISIS] La palabra '{palabra_real}' tuvo {total_real - correctas} errores "
+                f"de {total_real} muestras."
+            )
+
+    if len(analisis) == 0:
+        print("[ANÁLISIS] No hubo confusiones registradas en la matriz.")
+    else:
+        print("\n====================================================")
+        print("ANÁLISIS BÁSICO DE CONFUSIONES")
+        print("====================================================")
+        for item in analisis:
+            print(
+                f"Real='{item['real']}' -> Predicha='{item['predicha']}' | "
+                f"conteo={item['conteo']}/{item['total_real']}"
+            )
+            print(f"  {item['comentario']}")
+
+    return analisis
+
+
+# =========================================================
+# EVALUACIÓN COMPLETA
+# =========================================================
+
+def probar_modelo():
+    print("====================================================")
+    print("TEST MFCC + VQ 256 + HMM BAKIS + FORWARD LOG")
+    print("====================================================")
+    print(f"Palabras        : {PALABRAS}")
+    print(f"Carpeta modelos : {CARPETA_MODELOS}")
+    print(f"Codebook        : {RUTA_CODEBOOK}")
+    print(f"HMM             : {CARPETA_HMM}")
     print("====================================================")
 
-    modelos = cargar_modelos_desde_npz(
-        carpeta_modelos=carpeta_modelos,
-        palabras=PALABRAS,
-        codebook_size=codebook_size
-    )
+    centroides = cargar_codebook(RUTA_CODEBOOK)
+    modelos_hmm = cargar_modelos_hmm(CARPETA_HMM, PALABRAS)
+
+    # Entregables de verificación antes del test
+    resumen_A = verificar_diagonalidad_A(modelos_hmm)
+    resumen_B = verificar_sparsity_B_estado1(modelos_hmm)
+    guardar_verificacion_json(resumen_A, resumen_B)
 
     matriz = crear_matriz_confusion(PALABRAS)
     reporte = []
+    errores = []
 
     total = 0
     correctos = 0
 
-    # Recorremos cada palabra real.
     for i_real, palabra_real in enumerate(PALABRAS):
         rutas_test = sorted(glob.glob(os.path.join(palabra_real, "test", "*.wav")))
 
-        print(f"\n----------------------------------------------------")
+        print("\n----------------------------------------------------")
         print(f"Evaluando palabra real: {palabra_real}")
         print(f"Archivos test encontrados: {len(rutas_test)}")
         print("----------------------------------------------------")
 
+        if len(rutas_test) == 0:
+            errores.append({
+                "palabra": palabra_real,
+                "ruta": os.path.join(palabra_real, "test", "*.wav"),
+                "error": "sin archivos"
+            })
+            continue
+
         for ruta_audio in rutas_test:
             try:
-                prediccion, resultados, datos = clasificar_audio(
-                    ruta_audio,
-                    modelos,
-                    usar_promedio=True
+                prediccion, scores, O, datos = reconocer_audio(
+                    ruta_audio=ruta_audio,
+                    centroides=centroides,
+                    modelos_hmm=modelos_hmm
                 )
 
-                # Índice de la palabra predicha.
                 j_pred = PALABRAS.index(prediccion)
-
-                # Se suma en la matriz de confusión.
                 matriz[i_real, j_pred] += 1
 
-                es_correcta = (prediccion == palabra_real)
+                es_correcta = prediccion == palabra_real
+                total += 1
                 if es_correcta:
                     correctos += 1
-                total += 1
 
-                # Se arma una fila detallada para el reporte.
                 fila = {
                     "archivo": ruta_audio,
                     "real": palabra_real,
                     "predicha": prediccion,
                     "correcta": int(es_correcta),
-                    "num_frames": int(datos["num_frames"])
+                    "num_frames_mfcc": int(datos["num_frames"]),
+                    "longitud_O": int(len(O)),
+                    "duracion_recortada_s": round(float(datos["duracion_recortada_s"]), 6),
+                    "primeros_20_indices": " ".join(map(str, O[:20].tolist()))
                 }
 
                 for palabra_modelo in PALABRAS:
-                    fila[f"dist_total_{palabra_modelo}"] = resultados[palabra_modelo]["dist_total"]
-                    fila[f"dist_prom_{palabra_modelo}"] = resultados[palabra_modelo]["dist_prom"]
+                    fila[f"loglik_{palabra_modelo}"] = round(float(scores[palabra_modelo]), 6)
 
                 reporte.append(fila)
 
                 print(f"[TEST] {ruta_audio}")
-                print(f"       real={palabra_real} | pred={prediccion} | frames={datos['num_frames']}")
-                for palabra_modelo in PALABRAS:
-                    print(
-                        f"       {palabra_modelo:>6s} -> "
-                        f"dist_total={resultados[palabra_modelo]['dist_total']:.6f} | "
-                        f"dist_prom={resultados[palabra_modelo]['dist_prom']:.6f}"
-                    )
+                print(
+                    f"       real={palabra_real} | pred={prediccion} | "
+                    f"ok={es_correcta} | MFCC={datos['mfcc'].shape} | O_len={len(O)}"
+                )
+                print(f"       O[:20]={O[:20].tolist()}")
+
+                scores_ordenados = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                for palabra_modelo, score in scores_ordenados:
+                    marca = "<-- ganador" if palabra_modelo == prediccion else ""
+                    print(f"       {palabra_modelo:>8s}: {score:12.4f} {marca}")
 
             except Exception as e:
+                errores.append({"palabra": palabra_real, "ruta": ruta_audio, "error": str(e)})
                 print(f"[ERROR] {ruta_audio} -> {e}")
 
     accuracy = (correctos / total) * 100.0 if total > 0 else 0.0
 
-    # Impresión de la matriz en consola.
-    print("\n====================================================")
-    print(f"MATRIZ DE CONFUSION PARA K={codebook_size}")
-    print("====================================================")
-    print("Filas = palabra real, Columnas = predicción\n")
-    print("          " + "  ".join([f"{p:>6s}" for p in PALABRAS]))
-    for i, palabra_real in enumerate(PALABRAS):
-        fila = "  ".join([f"{matriz[i, j]:6d}" for j in range(len(PALABRAS))])
-        print(f"{palabra_real:>6s}  {fila}")
+    imprimir_matriz_confusion(matriz, PALABRAS)
+    analisis_confusiones = analizar_confusiones(matriz, PALABRAS)
 
     print("\n====================================================")
-    print(f"Accuracy total K={codebook_size}: {accuracy:.2f}%  ({correctos}/{total})")
+    print(f"Accuracy total: {accuracy:.2f}% ({correctos}/{total})")
     print("====================================================")
 
-    guardar_matriz_confusion_csv(matriz, PALABRAS, archivo_matriz)
-    guardar_reporte_csv(reporte, archivo_reporte)
+    guardar_matriz_confusion_csv(matriz, PALABRAS, ARCHIVO_MATRIZ)
+    guardar_reporte_csv(reporte, ARCHIVO_REPORTE, PALABRAS)
 
-    print(f"[GUARDADO] {archivo_matriz}")
-    print(f"[GUARDADO] {archivo_reporte}")
-
-    return {
-        "codebook_size": codebook_size,
+    resumen = {
         "accuracy": accuracy,
         "correctos": correctos,
         "total": total,
-        "matriz": matriz
+        "palabras": PALABRAS,
+        "tamano_matriz_confusion": f"{len(PALABRAS)}x{len(PALABRAS)}",
+        "matriz_confusion": matriz,
+        "analisis_confusiones": analisis_confusiones,
+        "errores": errores,
+        "archivo_matriz": ARCHIVO_MATRIZ,
+        "archivo_reporte": ARCHIVO_REPORTE,
+        "archivo_verificacion_A": ARCHIVO_VERIFICACION_A,
+        "archivo_verificacion_B": ARCHIVO_VERIFICACION_B,
+        "archivo_verificacion_json": ARCHIVO_VERIFICACION_JSON,
+        "carpeta_modelos": CARPETA_MODELOS,
+        "ruta_codebook": RUTA_CODEBOOK,
+        "carpeta_hmm": CARPETA_HMM
     }
 
+    with open(ARCHIVO_RESUMEN, "w", encoding="utf-8") as f:
+        json.dump(convertir_a_json_serializable(resumen), f, indent=2, ensure_ascii=False)
+
+    print(f"[GUARDADO] {ARCHIVO_MATRIZ}")
+    print(f"[GUARDADO] {ARCHIVO_REPORTE}")
+    print(f"[GUARDADO] {ARCHIVO_RESUMEN}")
+
+    if len(errores) > 0:
+        print("\n[ADVERTENCIA] Hubo errores o carpetas sin audios:")
+        for err in errores:
+            print(f"  - {err['ruta']} -> {err['error']}")
+
+    return resumen
+
 
 # =========================================================
-# FUNCIÓN PRINCIPAL
+# MAIN
 # =========================================================
 
-def main():
-    """
-    Ejecuta la evaluación completa para todos los tamaños de codebook.
-
-    Qué hace:
-    - prueba K=16,
-    - prueba K=32,
-    - prueba K=64,
-    - imprime un resumen final comparando accuracies.
-    """
-    print("====================================================")
-    print("TEST MULTIPLE DE RECONOCIMIENTO CON CODEBOOKS LBG-IS")
-    print("====================================================")
-    print(f"Orden LPC         : {ORDEN_LPC}")
-    print(f"Tamaños codebook  : {CODEBOOK_SIZES}")
-    print(f"Palabras          : {PALABRAS}")
-    print("====================================================")
-
-    resumen = []
-
-    for codebook_size in CODEBOOK_SIZES:
-        try:
-            resultado = probar_tamano_codebook(codebook_size)
-            resumen.append(resultado)
-        except Exception as e:
-            print(f"\n[ERROR] Falló el test para K={codebook_size}: {e}\n")
-
-    print("\n====================================================")
-    print("RESUMEN FINAL")
-    print("====================================================")
-    for r in resumen:
-        print(
-            f"K={r['codebook_size']:>2d} | "
-            f"Accuracy={r['accuracy']:.2f}% | "
-            f"Aciertos={r['correctos']}/{r['total']}"
-        )
-    print("====================================================")
-
-
-# Punto de entrada del programa.
 if __name__ == "__main__":
-    main()
+    probar_modelo()

@@ -18,7 +18,7 @@ duracion = 1
 # Palabra que se desea grabar.
 # Se puede cambiar por otra palabra del conjunto,
 # por ejemplo: "inicio", "alto", "pausa", "ruta", etc.
-palabra = "sigue"
+palabra = "alto"
 
 # ---------------------------------------------------------
 # CREACIÓN DE LA CARPETA PARA GUARDAR LAS GRABACIONES

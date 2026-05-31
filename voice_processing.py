@@ -3,56 +3,60 @@ import glob
 import json
 import numpy as np
 from scipy.io import wavfile
+from scipy.fftpack import dct
 
 # =========================================================
 # CONFIGURACIÓN GENERAL DEL PROYECTO
 # =========================================================
 
-# Lista de palabras que formarán las clases del sistema.
-# Cada palabra tendrá su propio conjunto de grabaciones y su propio codebook.
 PALABRAS = [
-    "alto", "busca", "camion", "carga", "deja",
-    "inicio", "mapa", "pausa", "ruta", "sigue"
+    "alto", "busca", "carga", "trailer", "arranca"
 ]
 
-# Orden del modelo LPC.
-# La práctica pide usar LPC de orden 12.
-ORDEN_LPC = 12
+# MFCC
+N_MFCC = 13
+N_FFT = 512
+N_FILTROS_MEL = 26
 
-# Tamaños de codebook a probar.
-# La práctica pide investigar con 16, 32 y 64 codevectors.
-CODEBOOK_SIZES = [16, 32, 64]
+# Codebook global VQ
+CODEBOOK_SIZE = 256
+KMEANS_MAX_ITER = 100
+KMEANS_TOL = 1e-5
+RANDOM_SEED = 42
 
-# Coeficiente del filtro de preénfasis.
-# Implementa H(z) = 1 - 0.95 z^-1
+# HMM discreto
+NUM_ESTADOS_HMM = 5          # Puedes cambiar entre 4 y 8
+NUM_SIMBOLOS = 256           # Debe coincidir con CODEBOOK_SIZE
+EPSILON_B = 1e-6             # Smoothing obligatorio para B
+
+# Audio
 ALPHA_PRENFASIS = 0.95
-
-# Longitud de cada trama.
-# 320 muestras a 16 kHz equivalen a 20 ms.
-FRAME_LENGTH = 320
-
-# Corrimiento entre tramas.
-# 128 muestras equivalen a 8 ms.
-HOP_LENGTH = 128
-
-# Factores para construir los umbrales de energía y ZCR.
-# Se multiplican por el valor máximo encontrado en cada archivo.
+FRAME_LENGTH = 320           # 20 ms si fs = 16 kHz
+HOP_LENGTH = 128             # 8 ms si fs = 16 kHz
 ENERGY_FACTOR = 0.03
 ZCR_FACTOR = 0.08
-
-# Margen adicional al recorte de voz, en milisegundos.
-# Se agrega un poco antes y después para no cortar bruscamente la palabra.
 MARGEN_MS = 65
 
-# Tolerancia relativa para detener el entrenamiento del LBG.
-# Si la distorsión cambia muy poco, se considera que ya convergió.
-TOL_REL = 1e-5
+# Salida
+CARPETA_SALIDA = "modelos_hmm_mfcc_vq"
 
-# Número máximo de iteraciones del algoritmo LBG.
-MAX_ITER_LBG = 50
 
-# Pequeña perturbación usada al dividir centroides en LBG.
-DELTA_SPLIT = 0.0001
+# =========================================================
+# UTILIDADES DE JSON
+# =========================================================
+
+def convertir_a_json_serializable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: convertir_a_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convertir_a_json_serializable(x) for x in obj]
+    return obj
 
 
 # =========================================================
@@ -60,78 +64,43 @@ DELTA_SPLIT = 0.0001
 # =========================================================
 
 def cargar_audio(ruta_audio):
-    """
-    Lee un archivo WAV y lo prepara para el procesamiento.
-
-    Qué hace:
-    1. Lee el archivo.
-    2. Si tiene dos canales, lo convierte a mono.
-    3. Lo convierte a float32.
-    4. Normaliza la amplitud.
-    5. Elimina el valor medio.
-    """
     fs, audio = wavfile.read(ruta_audio)
 
-    # Si el audio es estéreo, promedia ambos canales para trabajar en mono.
     if len(audio.shape) == 2:
         audio = np.mean(audio, axis=1)
         print(f"[INFO] Audio convertido a mono: {ruta_audio}")
 
-    # Convertimos a punto flotante para evitar problemas en operaciones posteriores.
     audio = audio.astype(np.float32)
 
-    # Normalización de amplitud.
-    # Esto ayuda a que distintas grabaciones tengan una escala comparable.
     max_val = np.max(np.abs(audio))
     if max_val > 0:
         audio = audio / max_val
 
-    # Quitamos la componente DC.
-    # Es decir, centramos la señal alrededor de cero.
     audio = audio - np.mean(audio)
-
     return fs, audio
 
 
 def aplicar_preenfasis(audio, alpha=0.95):
-    """
-    Aplica el filtro de preénfasis.
+    if len(audio) == 0:
+        return audio
 
-    Fórmula:
-        y[n] = x[n] - alpha * x[n-1]
-    """
     audio_pre = np.empty_like(audio)
-
-    # La primera muestra no tiene muestra anterior.
     audio_pre[0] = audio[0]
-
-    # Aplicamos la ecuación del filtro a partir de la segunda muestra.
     audio_pre[1:] = audio[1:] - alpha * audio[:-1]
-
     return audio_pre
 
 
 def dividir_en_tramas(audio, frame_length=320, hop_length=128):
-    """
-    Divide el audio en tramas o bloques.
-
-    Si la señal es más corta que una trama completa, se rellena con ceros.
-    """
     num_samples = len(audio)
 
-    # Si el audio es muy corto, lo rellenamos para formar una sola trama.
     if num_samples < frame_length:
         padded = np.zeros(frame_length, dtype=audio.dtype)
         padded[:num_samples] = audio
         return padded[np.newaxis, :]
 
-    # Número de tramas completas que caben con el salto definido.
     num_frames = 1 + (num_samples - frame_length) // hop_length
-
-    # Matriz donde cada fila será una trama.
     frames = np.zeros((num_frames, frame_length), dtype=audio.dtype)
 
-    # Extraemos cada bloque.
     for i in range(num_frames):
         start = i * hop_length
         end = start + frame_length
@@ -141,81 +110,48 @@ def dividir_en_tramas(audio, frame_length=320, hop_length=128):
 
 
 def crear_ventana_hamming(N=320):
-    """
-    Genera una ventana de Hamming de longitud N.
-    """
     n = np.arange(N)
     w = 0.54 - 0.46 * np.cos((2 * np.pi * n) / (N - 1))
     return w.astype(np.float32)
 
 
 def aplicar_ventana_hamming(frames):
-    """
-    Multiplica cada trama por una ventana de Hamming.
-    """
-    N = frames.shape[1]
-    ventana = crear_ventana_hamming(N)
-
-    # Multiplicación punto a punto entre cada trama y la ventana.
-    frames_windowed = frames * ventana
-
-    return frames_windowed, ventana
+    ventana = crear_ventana_hamming(frames.shape[1])
+    return frames * ventana, ventana
 
 
 def calcular_energia_por_trama(frames):
-    """
-    Calcula la energía promedio de cada trama.
-    """
     return np.sum(frames ** 2, axis=1) / frames.shape[1]
 
 
 def calcular_zcr_por_trama(frames):
-    """
-    Calcula la tasa de cruces por cero (ZCR) de cada trama.
-    """
     zcr = np.zeros(frames.shape[0], dtype=np.float32)
 
     for i, frame in enumerate(frames):
         signos = np.sign(frame)
+        signos[signos == 0] = 1
         crossings = np.sum(np.abs(np.diff(signos))) / 2
         zcr[i] = crossings / len(frame)
 
     return zcr
 
 
-def detectar_inicio_fin(frames, hop_length, frame_length,
-                        energy_factor=0.03, zcr_factor=0.08):
-    """
-    Detecta el inicio y el final de la voz dentro de un archivo.
-
-    Estrategia usada:
-    - Se calcula energía por trama.
-    - Se calcula ZCR por trama.
-    - Se construyen umbrales relativos.
-    - Se marca como voz una trama que supera ambos umbrales.
-    """
+def detectar_inicio_fin(frames, hop_length, frame_length, energy_factor=0.03, zcr_factor=0.08):
     energia = calcular_energia_por_trama(frames)
     zcr = calcular_zcr_por_trama(frames)
 
-    # Umbrales relativos respecto al valor máximo del archivo.
     energy_threshold = energy_factor * np.max(energia) if len(energia) > 0 else 0.0
     zcr_threshold = zcr_factor * np.max(zcr) if len(zcr) > 0 else 0.0
 
-    # Se considera voz si una trama supera ambos umbrales.
-    voice_flags = (zcr > zcr_threshold) & (energia > energy_threshold)
+    voice_flags = (energia > energy_threshold) & (zcr > zcr_threshold)
+    voice_idx = np.where(voice_flags)[0]
 
-    # Buscamos tramas marcadas como voz.
-    first_voice_frame = np.where(voice_flags)[0]
-
-    # Si no se detectó ninguna, devolvemos None.
-    if len(first_voice_frame) == 0:
+    if len(voice_idx) == 0:
         return None, None, energia, zcr, voice_flags, energy_threshold, zcr_threshold
 
-    # Primera y última trama con voz.
-    inicio_frame = first_voice_frame[0]
-    fin_frame = first_voice_frame[-1]
+    inicio_frame = voice_idx[0]
+    fin_frame = voice_idx[-1]
 
-    # Convertimos índices de trama a índices de muestra.
     start_sample = inicio_frame * hop_length
     end_sample = fin_frame * hop_length + frame_length
 
@@ -223,347 +159,91 @@ def detectar_inicio_fin(frames, hop_length, frame_length,
 
 
 def recortar_audio(audio, start_sample, end_sample):
-    """
-    Recorta la señal entre el inicio y el final detectados.
-    """
     if start_sample is None or end_sample is None:
         return None
-
     end_sample = min(end_sample, len(audio))
     return audio[start_sample:end_sample]
 
 
 # =========================================================
-# AUTOCORRELACIÓN Y LPC
+# MFCC
 # =========================================================
 
-def autocorrelacion_corta(frame, order=12):
-    """
-    Calcula la autocorrelación corta de una trama.
-    Después de aplicar la ventana, se obtiene la función de autocorrelación
-    y a partir de ella se calculan los coeficientes LPC.
-    """
-    r = np.zeros(order + 1, dtype=np.float64)
+def hz_to_mel(hz):
+    return 2595.0 * np.log10(1.0 + hz / 700.0)
 
-    for k in range(order + 1):
-        r[k] = np.sum(frame[:len(frame) - k] * frame[k:])
 
-    return r
+def mel_to_hz(mel):
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
 
-def levinson_durbin(r, order=12):
-    """
-    Implementa el algoritmo recursivo de Levinson-Durbin.
-    """
-    # Vector de coeficientes LPC.
-    # a[0] se fija en 1 por convención.
-    a = np.zeros(order + 1, dtype=np.float64)
-    a[0] = 1.0
+def crear_banco_mel(fs, n_fft=512, n_filters=26, fmin=0.0, fmax=None):
+    if fmax is None:
+        fmax = fs / 2.0
 
-    # Error inicial igual a r[0].
-    e = r[0]
+    mel_min = hz_to_mel(fmin)
+    mel_max = hz_to_mel(fmax)
 
-    # Si la energía es casi cero, devolvemos el vector trivial.
-    if e <= 1e-12:
-        return a, e
+    mel_points = np.linspace(mel_min, mel_max, n_filters + 2)
+    hz_points = mel_to_hz(mel_points)
 
-    # Construcción recursiva del predictor.
-    for i in range(1, order + 1):
-        suma = 0.0
+    bins = np.floor((n_fft + 1) * hz_points / fs).astype(int)
+    bins = np.clip(bins, 0, n_fft // 2)
 
-        # Parte acumulada de la recursión.
-        for j in range(1, i):
-            suma += a[j] * r[i - j]
+    filterbank = np.zeros((n_filters, n_fft // 2 + 1), dtype=np.float64)
 
-        # Coeficiente de reflexión.
-        k = (r[i] - suma) / e
+    for m in range(1, n_filters + 1):
+        left = bins[m - 1]
+        center = bins[m]
+        right = bins[m + 1]
 
-        # Actualización temporal de coeficientes.
-        a_new = a.copy()
-        a_new[i] = k
+        if center <= left:
+            center = left + 1
+        if right <= center:
+            right = center + 1
+        right = min(right, n_fft // 2)
 
-        for j in range(1, i):
-            a_new[j] = a[j] - k * a[i - j]
+        for k in range(left, min(center, n_fft // 2 + 1)):
+            filterbank[m - 1, k] = (k - left) / max(center - left, 1)
 
-        a = a_new
+        for k in range(center, min(right, n_fft // 2 + 1)):
+            filterbank[m - 1, k] = (right - k) / max(right - center, 1)
 
-        # Actualización del error.
-        e = (1.0 - k * k) * e
+    return filterbank
 
-        # Evitamos que el error se vuelva numéricamente inestable.
-        if e <= 1e-12:
-            e = 1e-12
-            break
 
-    return a, e
+def extraer_mfcc_por_trama(frames_hamming, fs, n_mfcc=13, n_fft=512, n_filters=26):
+    spectrum = np.fft.rfft(frames_hamming, n=n_fft)
+    power_spectrum = (1.0 / n_fft) * (np.abs(spectrum) ** 2)
 
+    mel_bank = crear_banco_mel(fs, n_fft=n_fft, n_filters=n_filters)
+    mel_energies = np.dot(power_spectrum, mel_bank.T)
+    mel_energies = np.maximum(mel_energies, 1e-12)
 
-def extraer_lpc_por_trama(frames_hamming, order=12):
-    """
-    Para cada trama:
-    1. calcula la autocorrelación,
-    2. obtiene los coeficientes LPC,
-    3. guarda también el error de predicción.
-    """
-    num_frames = frames_hamming.shape[0]
+    log_mel = np.log(mel_energies)
+    mfcc = dct(log_mel, type=2, axis=1, norm="ortho")[:, :n_mfcc]
 
-    lpc_vectors = np.zeros((num_frames, order + 1), dtype=np.float64)
-    r_vectors = np.zeros((num_frames, order + 1), dtype=np.float64)
-    errors = np.zeros(num_frames, dtype=np.float64)
+    return mfcc.astype(np.float64)
 
-    for i in range(num_frames):
-        frame = frames_hamming[i]
 
-        # Autocorrelación de la trama.
-        r = autocorrelacion_corta(frame, order=order)
-
-        # LPC usando Levinson-Durbin.
-        a, e = levinson_durbin(r, order=order)
-
-        r_vectors[i, :] = r
-        lpc_vectors[i, :] = a
-        errors[i] = e
-
-    return lpc_vectors, r_vectors, errors
-
-
-# =========================================================
-# CONVERSIÓN ENTRE LPC Y LSF
-# =========================================================
-
-def _unique_angles_sorted(angles, tol=1e-4):
-    """
-    Ordena ángulos y elimina duplicados casi iguales.
-
-    Esto ayuda a limpiar el resultado numérico durante la conversión a LSF.
-    """
-    if len(angles) == 0:
-        return angles
-
-    angles = np.sort(angles)
-    unicos = [angles[0]]
-
-    for ang in angles[1:]:
-        if np.abs(ang - unicos[-1]) > tol:
-            unicos.append(ang)
-
-    return np.array(unicos)
-
-
-def lpc_a_lsf(a):
-    """
-    Convierte un vector LPC a LSF.
-
-    Aunque la comparación final se hace con Itakura-Saito,
-    el clustering se realiza sobre LSF, porque son más estables
-    y convenientes para el agrupamiento.
-    """
-    a = np.asarray(a, dtype=np.float64)
-
-    if a[0] == 0:
-        raise ValueError("El primer coeficiente LPC no puede ser cero.")
-
-    # Normalización para asegurar a[0] = 1.
-    a = a / a[0]
-
-    # Construcción del polinomio AR.
-    ar = np.concatenate(([1.0], -a[1:]))
-    p = len(ar) - 1
-
-    # Construcción de polinomios simétricos y antisimétricos.
-    ar_padded = np.concatenate((ar, [0.0]))
-    ar_rev = ar_padded[::-1]
-
-    P = ar_padded + ar_rev
-    Q = ar_padded - ar_rev
-
-    # División por factores fijos, como se hace en la conversión estándar.
-    P_red, _ = np.polydiv(P, np.array([1.0, 1.0]))
-    Q_red, _ = np.polydiv(Q, np.array([1.0, -1.0]))
-
-    P_red = np.real_if_close(P_red, tol=1000).astype(np.float64)
-    Q_red = np.real_if_close(Q_red, tol=1000).astype(np.float64)
-
-    # Raíces de ambos polinomios.
-    roots_P = np.roots(P_red)
-    roots_Q = np.roots(Q_red)
-
-    # Extraemos sus ángulos.
-    ang_P = np.abs(np.angle(roots_P))
-    ang_Q = np.abs(np.angle(roots_Q))
-
-    ang = np.concatenate((ang_P, ang_Q))
-
-    # Conservamos solo los ángulos válidos dentro de (0, pi).
-    eps = 1e-6
-    ang = ang[(ang > eps) & (ang < np.pi - eps)]
-
-    # Quitamos duplicados numéricos y ordenamos.
-    ang = _unique_angles_sorted(ang, tol=1e-4)
-
-    # Validación del número esperado de LSF.
-    if len(ang) < p:
-        raise ValueError(
-            f"No se pudieron obtener suficientes LSF. "
-            f"Esperadas: {p}, obtenidas: {len(ang)}"
-        )
-
-    if len(ang) > p:
-        ang = ang[:p]
-
-    return ang
-
-
-def _convolve_all(polys):
-    """
-    Convoluciona una lista de polinomios.
-    """
-    out = np.array([1.0], dtype=np.float64)
-
-    for p in polys:
-        out = np.convolve(out, p)
-
-    return out
-
-
-def _lsf_to_PQ(lsf):
-    """
-    Construye los polinomios P y Q a partir de un vector LSF.
-    """
-    lsf = np.asarray(lsf, dtype=np.float64)
-    p = len(lsf)
-
-    if p % 2 != 0:
-        raise ValueError("Esta implementación espera orden LPC par.")
-
-    # Separación de frecuencias impares y pares.
-    w_odd = lsf[0::2]
-    w_even = lsf[1::2]
-
-    P_factors = [
-        np.array([1.0, -2.0 * np.cos(w), 1.0], dtype=np.float64)
-        for w in w_odd
-    ]
-    Q_factors = [
-        np.array([1.0, -2.0 * np.cos(w), 1.0], dtype=np.float64)
-        for w in w_even
-    ]
-
-    P = _convolve_all(P_factors)
-    Q = _convolve_all(Q_factors)
-
-    P = np.convolve(P, np.array([1.0, 1.0], dtype=np.float64))
-    Q = np.convolve(Q, np.array([1.0, -1.0], dtype=np.float64))
-
-    return P, Q
-
-
-def lsf_a_lpc(lsf):
-    """
-    Convierte un vector LSF a LPC.
-
-    Esto se necesita porque el agrupamiento se hace en LSF,
-    pero la distancia Itakura-Saito se evalúa usando LPC.
-    """
-    lsf = np.asarray(lsf, dtype=np.float64)
-    lsf = np.sort(lsf)
-
-    # Validamos que estén dentro del intervalo correcto.
-    if np.any(lsf <= 0) or np.any(lsf >= np.pi):
-        raise ValueError("Los LSF deben estar estrictamente dentro de (0, pi).")
-
-    # Validamos que estén estrictamente ordenados.
-    if np.any(np.diff(lsf) <= 0):
-        raise ValueError("Los LSF deben estar estrictamente ordenados.")
-
-    p = len(lsf)
-
-    if p % 2 != 0:
-        raise ValueError("Esta implementación espera orden LPC par.")
-
-    P, Q = _lsf_to_PQ(lsf)
-
-    # Reconstrucción del polinomio A(z).
-    A = 0.5 * (P + Q)
-    A = A[:-1]
-    A = np.real_if_close(A).astype(np.float64)
-
-    if abs(A[0]) < 1e-12:
-        raise ValueError("Conversión LSF->LPC inválida: coeficiente líder cero.")
-
-    A = A / A[0]
-    return A
-
-
-def proyectar_lsf_valido(lsf, margen=1e-3):
-    """
-    Ajusta un vector LSF para que sea válido:
-    - dentro de (0, pi),
-    - ordenado,
-    - sin elementos demasiado pegados.
-
-    Esto ayuda a mantener estabilidad en el entrenamiento del codebook.
-    """
-    lsf = np.asarray(lsf, dtype=np.float64).copy()
-    lsf = np.clip(lsf, margen, np.pi - margen)
-    lsf.sort()
-
-    for i in range(1, len(lsf)):
-        if lsf[i] <= lsf[i - 1] + margen:
-            lsf[i] = lsf[i - 1] + margen
-
-    if lsf[-1] >= np.pi - margen:
-        lsf[-1] = np.pi - margen
-
-        for i in range(len(lsf) - 2, -1, -1):
-            if lsf[i] >= lsf[i + 1] - margen:
-                lsf[i] = lsf[i + 1] - margen
-
-    return lsf
-
-
-# =========================================================
-# PIPELINE COMPLETO PARA UN SOLO AUDIO
-# =========================================================
-
-def procesar_audio_a_caracteristicas(
+def procesar_audio_a_mfcc(
     ruta_audio,
     alpha=0.95,
     frame_length=320,
     hop_length=128,
-    orden_lpc=12,
+    n_mfcc=13,
+    n_fft=512,
+    n_filters=26,
     energy_factor=0.03,
     zcr_factor=0.08,
     margen_ms=65
 ):
-    """
-    Procesa un archivo completo desde audio crudo hasta vectores útiles
-    para el entrenamiento del sistema.
-
-    Flujo:
-    1. leer audio,
-    2. aplicar preénfasis,
-    3. dividir en tramas,
-    4. aplicar Hamming,
-    5. detectar voz,
-    6. recortar la palabra,
-    7. volver a tramificar la señal recortada,
-    8. obtener LPC,
-    9. convertir a LSF.
-    """
-    # Cargamos el archivo.
     fs, audio = cargar_audio(ruta_audio)
-
-    # Aplicamos preénfasis.
     audio_pre = aplicar_preenfasis(audio, alpha=alpha)
 
-    # Primera división en tramas para detectar voz.
     frames = dividir_en_tramas(audio_pre, frame_length=frame_length, hop_length=hop_length)
-
-    # Aplicamos Hamming a esas tramas.
     frames_hamming, _ = aplicar_ventana_hamming(frames)
 
-    # Detectamos inicio y fin de la palabra.
     resultado = detectar_inicio_fin(
         frames_hamming,
         hop_length=hop_length,
@@ -574,577 +254,540 @@ def procesar_audio_a_caracteristicas(
 
     start_sample, end_sample, energia, zcr, voice_flags, energy_threshold, zcr_threshold = resultado
 
-    # Si no se detectó voz, se detiene.
     if start_sample is None or end_sample is None:
         raise ValueError(f"No se detectó voz en el archivo: {ruta_audio}")
 
-    # Agregamos un margen adicional al inicio y final.
     margen = int((margen_ms / 1000.0) * fs)
     start_sample = max(0, start_sample - margen)
     end_sample = min(len(audio_pre), end_sample + margen)
 
-    # Recortamos la señal.
     audio_recortado = recortar_audio(audio_pre, start_sample, end_sample)
 
-    # Volvemos a tramificar ahora solo la región útil de voz.
     frames_rec = dividir_en_tramas(audio_recortado, frame_length=frame_length, hop_length=hop_length)
-
-    # Aplicamos nuevamente Hamming sobre la señal ya recortada.
     frames_rec_hamming, _ = aplicar_ventana_hamming(frames_rec)
 
-    # Extraemos LPC, autocorrelación y error.
-    lpc, r, errors = extraer_lpc_por_trama(frames_rec_hamming, order=orden_lpc)
+    mfcc = extraer_mfcc_por_trama(
+        frames_rec_hamming,
+        fs=fs,
+        n_mfcc=n_mfcc,
+        n_fft=n_fft,
+        n_filters=n_filters
+    )
 
-    # Convertimos cada vector LPC a LSF.
-    lsf = []
-    indices_validos = []
-
-    for i, a in enumerate(lpc):
-        try:
-            lsf_i = lpc_a_lsf(a)
-            lsf.append(lsf_i)
-            indices_validos.append(i)
-        except Exception:
-            # Si una trama falla en la conversión, se ignora.
-            continue
-
-    if len(lsf) == 0:
-        raise ValueError(f"No se pudieron obtener vectores LSF en: {ruta_audio}")
-
-    lsf = np.array(lsf, dtype=np.float64)
-    indices_validos = np.array(indices_validos, dtype=int)
-
-    # Conservamos solo las tramas válidas.
-    lpc = lpc[indices_validos]
-    r = r[indices_validos]
-    errors = errors[indices_validos]
+    if mfcc.shape[0] == 0:
+        raise ValueError(f"No se pudieron obtener MFCC en: {ruta_audio}")
 
     return {
         "ruta": ruta_audio,
         "fs": fs,
-        "lpc": lpc,
-        "r": r,
-        "errors": errors,
-        "lsf": lsf,
-        "num_frames": len(lsf)
+        "mfcc": mfcc,
+        "num_frames": int(mfcc.shape[0]),
+        "duracion_recortada_s": float(len(audio_recortado) / fs)
     }
 
 
 # =========================================================
-# DISTANCIA ITAKURA-SAITO
+# K-MEANS GLOBAL PARA CODEBOOK 256
 # =========================================================
 
-def ra_desde_lpc(a):
-    """
-    Calcula la autocorrelación corta de los coeficientes LPC.
-    """
-    a = np.asarray(a, dtype=np.float64)
-    P = len(a) - 1
-    ra = np.zeros(P + 1, dtype=np.float64)
+def inicializar_centroides_kmeans(X, K, seed=42):
+    rng = np.random.default_rng(seed)
+    n = X.shape[0]
 
-    for i in range(P + 1):
-        ra[i] = np.sum(a[:P + 1 - i] * a[i:])
-
-    return ra
-
-
-def distancia_is_desde_r_y_lpc(r, a, sigma2=1.0, piso=1e-12):
-    """
-    Calcula la distancia Itakura-Saito usando:
-    - la autocorrelación de una trama,
-    - y un vector LPC de referencia.
-    """
-    r = np.asarray(r, dtype=np.float64)
-    a = np.asarray(a, dtype=np.float64)
-
-    ra = ra_desde_lpc(a)
-    P = min(len(r), len(ra)) - 1
-
-    d = (r[0] * ra[0] + 2.0 * np.sum(r[1:P+1] * ra[1:P+1])) / max(sigma2, piso)
-
-    return float(d)
-
-
-def asignar_clusters_is(r_vectors, centroides_lpc, sigma2_mode="frame"):
-    """
-    Asigna cada vector de entrenamiento al centroide más cercano
-    usando distancia Itakura-Saito.
-    """
-    N = r_vectors.shape[0]
-    K = len(centroides_lpc)
-
-    # Matriz de distancias: filas = vectores, columnas = centroides.
-    distancias = np.zeros((N, K), dtype=np.float64)
-
-    for i in range(N):
-        r = r_vectors[i]
-
-        # Opcionalmente usamos la energía de la trama como sigma^2.
-        sigma2 = max(r[0], 1e-12) if sigma2_mode == "frame" else 1.0
-
-        for k in range(K):
-            distancias[i, k] = distancia_is_desde_r_y_lpc(
-                r,
-                centroides_lpc[k],
-                sigma2=sigma2
-            )
-
-    # Elegimos el centroide con menor distancia.
-    asignaciones = np.argmin(distancias, axis=1)
-    dmin = distancias[np.arange(N), asignaciones]
-
-    # Distorsión global.
-    distortion_total = np.sum(dmin)
-
-    return asignaciones, distancias, distortion_total
-
-
-# =========================================================
-# ENTRENAMIENTO LBG CON DISTANCIA IS
-# =========================================================
-
-def recalcular_centroides_lsf(lsf_vectors, asignaciones, K, centroides_prev=None):
-    """
-    Recalcula centroides como el promedio de los vectores asignados.
-    """
-    P = lsf_vectors.shape[1]
-    nuevos = np.zeros((K, P), dtype=np.float64)
-
-    for k in range(K):
-        idx = np.where(asignaciones == k)[0]
-
-        if len(idx) == 0:
-            # Si un cluster queda vacío, se conserva el centroide anterior.
-            if centroides_prev is None:
-                raise ValueError(f"Cluster vacío en k={k} y no hay centroides_prev.")
-            nuevos[k] = centroides_prev[k]
-        else:
-            nuevos[k] = np.mean(lsf_vectors[idx], axis=0)
-
-    return nuevos
-
-
-def evaluar_codebook_is(r_vectors, centroides_lsf, sigma2_mode="frame"):
-    """
-    Evalúa un conjunto de centroides:
-    1. fuerza LSF válidos,
-    2. convierte centroides a LPC,
-    3. asigna vectores con distancia IS,
-    4. devuelve la distorsión global.
-    """
-    centroides_lsf_validos = np.array(
-        [proyectar_lsf_valido(c) for c in centroides_lsf],
-        dtype=np.float64
-    )
-
-    centroides_lpc = [lsf_a_lpc(c) for c in centroides_lsf_validos]
-
-    asignaciones, distancias, D = asignar_clusters_is(
-        r_vectors,
-        centroides_lpc,
-        sigma2_mode=sigma2_mode
-    )
-
-    return asignaciones, distancias, D, centroides_lpc, centroides_lsf_validos
-
-
-def actualizar_con_descenso(
-    r_vectors,
-    centroides_lsf_old,
-    centroides_lsf_prop,
-    D_old,
-    sigma2_mode="frame",
-    max_backtracking=12
-):
-    """
-    Intenta actualizar los centroides sin empeorar la distorsión.
-
-    Si el nuevo promedio propuesto empeora la función objetivo,
-    se reduce el paso con backtracking.
-
-    Esto hace al entrenamiento más estable.
-    """
-    eta = 1.0
-
-    for _ in range(max_backtracking):
-        centroides_try = centroides_lsf_old + eta * (centroides_lsf_prop - centroides_lsf_old)
-        centroides_try = np.array([proyectar_lsf_valido(c) for c in centroides_try])
-
-        asign, dist, D_try, centroides_lpc_try, centroides_lsf_try = evaluar_codebook_is(
-            r_vectors,
-            centroides_try,
-            sigma2_mode=sigma2_mode
+    if n < K:
+        raise ValueError(
+            f"No hay suficientes vectores MFCC para K={K}. "
+            f"Solo hay {n} vectores. Necesitas al menos {K}."
         )
 
-        if D_try <= D_old + 1e-10:
-            return centroides_lsf_try, asign, dist, D_try, centroides_lpc_try, eta
-
-        eta *= 0.5
-
-    # Si ninguna actualización mejora, se conservan los centroides previos.
-    asign, dist, D_same, centroides_lpc_same, centroides_lsf_same = evaluar_codebook_is(
-        r_vectors,
-        centroides_lsf_old,
-        sigma2_mode=sigma2_mode
-    )
-
-    return centroides_lsf_same, asign, dist, D_same, centroides_lpc_same, 0.0
+    indices = rng.choice(n, size=K, replace=False)
+    return X[indices].copy()
 
 
-def split_centroides_lsf(centroides_lsf, delta=0.0001):
-    """
-    Divide cada centroide en dos centroides ligeramente perturbados.
-    """
-    nuevos = []
-
-    for c in centroides_lsf:
-        c1 = proyectar_lsf_valido(c - delta)
-        c2 = proyectar_lsf_valido(c + delta)
-        nuevos.append(c1)
-        nuevos.append(c2)
-
-    return np.array(nuevos, dtype=np.float64)
+def asignar_clusters_euclidiana(X, centroides):
+    # Distancia euclidiana cuadrática usando identidad ||x-c||^2
+    x2 = np.sum(X ** 2, axis=1, keepdims=True)
+    c2 = np.sum(centroides ** 2, axis=1, keepdims=True).T
+    dist2 = x2 + c2 - 2.0 * X @ centroides.T
+    dist2 = np.maximum(dist2, 0.0)
+    return np.argmin(dist2, axis=1), dist2
 
 
-def entrenar_lbg_is_monotono(
-    lsf_vectors,
-    r_vectors,
-    K_objetivo=16,
-    tol_rel=1e-4,
-    max_iter=50,
-    sigma2_mode="frame",
-    delta_split=0.0001,
-    verbose=True
-):
-    """
-    Entrena un codebook usando LBG con distancia Itakura-Saito.
-
-    Flujo:
-    1. se calcula un centroide inicial,
-    2. se divide hasta alcanzar K centroides,
-    3. se asignan vectores al centroide más cercano,
-    4. se recalculan centroides,
-    5. se repite hasta converger.
-    """
-    # Centroide inicial = promedio de todos los vectores LSF.
-    c0 = np.mean(lsf_vectors, axis=0)
-    c0 = proyectar_lsf_valido(c0)
-    centroides_lsf = np.array([c0], dtype=np.float64)
+def entrenar_codebook_kmeans(X, K=256, max_iter=100, tol=1e-5, seed=42, verbose=True):
+    centroides = inicializar_centroides_kmeans(X, K, seed=seed)
+    rng = np.random.default_rng(seed + 1)
 
     historial = []
+    distorsion_anterior = None
 
-    # Seguimos duplicando centroides hasta llegar al tamaño deseado.
-    while len(centroides_lsf) < K_objetivo:
-        centroides_lsf = split_centroides_lsf(centroides_lsf, delta=delta_split)
+    for it in range(max_iter):
+        asignaciones, dist2 = asignar_clusters_euclidiana(X, centroides)
+        dist_min = dist2[np.arange(X.shape[0]), asignaciones]
+        distorsion = float(np.mean(dist_min))
 
-        # Si por duplicación excedemos el tamaño deseado, recortamos.
-        if len(centroides_lsf) > K_objetivo:
-            centroides_lsf = centroides_lsf[:K_objetivo]
+        nuevos = np.zeros_like(centroides)
+        for k in range(K):
+            idx = np.where(asignaciones == k)[0]
+            if len(idx) == 0:
+                # Reubicar cluster vacío en un punto aleatorio real.
+                nuevos[k] = X[rng.integers(0, X.shape[0])]
+            else:
+                nuevos[k] = np.mean(X[idx], axis=0)
 
-        # Evaluación inicial del codebook actual.
-        asignaciones, distancias, D_old, centroides_lpc, centroides_lsf = evaluar_codebook_is(
-            r_vectors,
-            centroides_lsf,
-            sigma2_mode=sigma2_mode
-        )
+        if distorsion_anterior is None:
+            cambio_rel = np.inf
+        else:
+            cambio_rel = abs(distorsion_anterior - distorsion) / max(abs(distorsion_anterior), 1e-12)
+
+        historial.append({
+            "iter": int(it),
+            "distorsion_media": float(distorsion),
+            "cambio_relativo": float(cambio_rel) if np.isfinite(cambio_rel) else None
+        })
 
         if verbose:
-            print(f"\n[K={len(centroides_lsf):2d}] Dist inicial = {D_old:.6f}")
+            print(f"  iter={it:03d} | dist={distorsion:.6f} | rel={cambio_rel:.6e}")
 
-        # Refinamiento iterativo.
-        for it in range(max_iter):
-            # Nuevo promedio por cluster.
-            centroides_prop = recalcular_centroides_lsf(
-                lsf_vectors,
-                asignaciones,
-                K=len(centroides_lsf),
-                centroides_prev=centroides_lsf
-            )
+        centroides = nuevos
 
-            centroides_prop = np.array([proyectar_lsf_valido(c) for c in centroides_prop])
+        if distorsion_anterior is not None and cambio_rel < tol:
+            break
 
-            # Intentamos actualizar sin empeorar la distorsión.
-            centroides_new, asign_new, dist_new, D_new, centroides_lpc_new, eta = actualizar_con_descenso(
-                r_vectors=r_vectors,
-                centroides_lsf_old=centroides_lsf,
-                centroides_lsf_prop=centroides_prop,
-                D_old=D_old,
-                sigma2_mode=sigma2_mode
-            )
+        distorsion_anterior = distorsion
 
-            # Cambio relativo de la distorsión.
-            rel = abs(D_old - D_new) / max(abs(D_old), 1e-12)
-
-            historial.append({
-                "K": int(len(centroides_lsf)),
-                "iter": int(it),
-                "dist": float(D_new),
-                "rel": float(rel),
-                "eta": float(eta)
-            })
-
-            if verbose:
-                print(
-                    f"  iter={it:02d} | Dist={D_new:.6f} | Rel={rel:.6e} | eta={eta:.4f}"
-                )
-
-            # Actualizamos el estado.
-            centroides_lsf = centroides_new
-            asignaciones = asign_new
-            distancias = dist_new
-            centroides_lpc = centroides_lpc_new
-
-            # Criterio de paro.
-            if rel < tol_rel:
-                break
-
-            D_old = D_new
+    # Asignaciones finales con centroides finales
+    asignaciones, dist2 = asignar_clusters_euclidiana(X, centroides)
+    dist_min = dist2[np.arange(X.shape[0]), asignaciones]
 
     return {
-        "centroides_lsf": centroides_lsf,
-        "centroides_lpc": np.array([lsf_a_lpc(c) for c in centroides_lsf]),
+        "centroides": centroides,
         "asignaciones": asignaciones,
-        "distancias": distancias,
+        "distorsion_media": float(np.mean(dist_min)),
         "historial": historial
     }
 
 
+def mfcc_a_indices_vq(mfcc, centroides):
+    indices, _ = asignar_clusters_euclidiana(mfcc, centroides)
+    return indices.astype(np.int64)
+
+
 # =========================================================
-# CARGA DE DATOS DE ENTRENAMIENTO POR PALABRA
+# RECOLECCIÓN DE DATOS MFCC
 # =========================================================
 
-def cargar_datos_entrenamiento_palabra(
-    palabra,
-    orden_lpc=12,
-    alpha=0.95,
-    frame_length=320,
-    hop_length=128,
-    energy_factor=0.03,
-    zcr_factor=0.08,
-    margen_ms=65
-):
-    """
-    Carga todos los audios de entrenamiento de una palabra,
-    los procesa y junta todos sus vectores.
+def recolectar_mfcc_entrenamiento():
+    mfcc_global = []
+    registros = []
+    fallidos = []
 
-    Estructura esperada:
-        palabra/train/*.wav
-    """
-    patron = os.path.join(palabra, "train", "*.wav")
-    rutas = sorted(glob.glob(patron))
+    print("\n====================================================")
+    print("EXTRACCIÓN MFCC DE TODOS LOS AUDIOS DE ENTRENAMIENTO")
+    print("====================================================")
 
-    if len(rutas) == 0:
-        raise FileNotFoundError(f"No se encontraron audios de entrenamiento en: {patron}")
+    for palabra in PALABRAS:
+        patron = os.path.join(palabra, "train", "*.wav")
+        rutas = sorted(glob.glob(patron))
 
-    lsf_all = []
-    r_all = []
-    archivos_ok = []
-    archivos_fallidos = []
+        print(f"\nPalabra: {palabra}")
+        print(f"Archivos encontrados: {len(rutas)}")
 
-    print(f"\n====================================================")
-    print(f"Palabra: {palabra}")
-    print(f"Archivos train encontrados: {len(rutas)}")
-    print(f"====================================================")
+        if len(rutas) == 0:
+            fallidos.append({"palabra": palabra, "ruta": patron, "error": "sin archivos"})
+            continue
 
-    for ruta in rutas:
-        try:
-            datos = procesar_audio_a_caracteristicas(
-                ruta_audio=ruta,
-                alpha=alpha,
-                frame_length=frame_length,
-                hop_length=hop_length,
-                orden_lpc=orden_lpc,
-                energy_factor=energy_factor,
-                zcr_factor=zcr_factor,
-                margen_ms=margen_ms
-            )
+        for ruta in rutas:
+            try:
+                datos = procesar_audio_a_mfcc(
+                    ruta_audio=ruta,
+                    alpha=ALPHA_PRENFASIS,
+                    frame_length=FRAME_LENGTH,
+                    hop_length=HOP_LENGTH,
+                    n_mfcc=N_MFCC,
+                    n_fft=N_FFT,
+                    n_filters=N_FILTROS_MEL,
+                    energy_factor=ENERGY_FACTOR,
+                    zcr_factor=ZCR_FACTOR,
+                    margen_ms=MARGEN_MS
+                )
 
-            lsf_all.append(datos["lsf"])
-            r_all.append(datos["r"])
-            archivos_ok.append(ruta)
+                mfcc = datos["mfcc"]
+                mfcc_global.append(mfcc)
+                registros.append({
+                    "palabra": palabra,
+                    "ruta": ruta,
+                    "mfcc": mfcc,
+                    "num_frames": datos["num_frames"],
+                    "duracion_recortada_s": datos["duracion_recortada_s"]
+                })
 
-            print(f"[OK] {ruta} -> {datos['num_frames']} tramas válidas")
+                print(
+                    f"[OK] {os.path.basename(ruta)} | MFCC={mfcc.shape} | "
+                    f"dur={datos['duracion_recortada_s']:.3f}s"
+                )
 
-        except Exception as e:
-            archivos_fallidos.append((ruta, str(e)))
-            print(f"[WARN] {ruta} -> {e}")
+            except Exception as e:
+                fallidos.append({"palabra": palabra, "ruta": ruta, "error": str(e)})
+                print(f"[WARN] {ruta} -> {e}")
 
-    if len(lsf_all) == 0:
-        raise RuntimeError(f"No hubo archivos válidos para entrenar la palabra: {palabra}")
+    if len(mfcc_global) == 0:
+        raise RuntimeError("No se pudo extraer ningún MFCC. Revisa rutas y audios.")
 
-    # Unimos todos los vectores de todos los audios en una sola matriz.
-    lsf_all = np.vstack(lsf_all)
-    r_all = np.vstack(r_all)
+    mfcc_global = np.vstack(mfcc_global)
 
-    print(f"\nResumen palabra '{palabra}':")
-    print(f"  Archivos válidos   : {len(archivos_ok)}")
-    print(f"  Archivos fallidos  : {len(archivos_fallidos)}")
-    print(f"  Total vectores LSF : {lsf_all.shape[0]}")
-    print(f"  Dimensión LSF      : {lsf_all.shape[1]}")
+    print("\nResumen MFCC global:")
+    print(f"  Audios válidos      : {len(registros)}")
+    print(f"  Audios fallidos     : {len(fallidos)}")
+    print(f"  Matriz MFCC global  : {mfcc_global.shape}")
+    print(f"  Dimensión MFCC      : {mfcc_global.shape[1]}")
 
-    return {
+    return mfcc_global, registros, fallidos
+
+
+# =========================================================
+# HMM POR INGENIERÍA DE CONTEOS
+# =========================================================
+
+def segmentar_linealmente(O, N):
+    O = np.asarray(O, dtype=np.int64)
+    T = len(O)
+
+    if T < N:
+        raise ValueError(f"La secuencia tiene T={T}, menor que N={N} estados.")
+
+    indices = np.array_split(np.arange(T), N)
+    segmentos = [O[idx] for idx in indices]
+    return segmentos
+
+
+def estimar_B_por_conteos(secuencias_O, N, M=256, epsilon=1e-6):
+    B_counts = np.zeros((N, M), dtype=np.float64)
+
+    for O in secuencias_O:
+        segmentos = segmentar_linealmente(O, N)
+        for estado, segmento in enumerate(segmentos):
+            for simbolo in segmento:
+                if simbolo < 0 or simbolo >= M:
+                    raise ValueError(f"Símbolo fuera de rango [0,{M-1}]: {simbolo}")
+                B_counts[estado, simbolo] += 1.0
+
+    B = B_counts + epsilon
+    B = B / B.sum(axis=1, keepdims=True)
+
+    return B, B_counts
+
+
+def estimar_A_por_duracion(secuencias_O, N):
+    A = np.zeros((N, N), dtype=np.float64)
+    duraciones_por_estado = [[] for _ in range(N)]
+
+    for O in secuencias_O:
+        segmentos = segmentar_linealmente(O, N)
+        for i, segmento in enumerate(segmentos):
+            duraciones_por_estado[i].append(len(segmento))
+
+    dur_prom = np.zeros(N, dtype=np.float64)
+
+    for i in range(N):
+        dur_prom[i] = np.mean(duraciones_por_estado[i])
+
+        if i == N - 1:
+            A[i, i] = 1.0
+        else:
+            # Si un estado dura d frames, la probabilidad de salir en cada frame es aprox. 1/d.
+            # Por lo tanto, a_ii=(d-1)/d y a_i,i+1=1/d.
+            d = max(dur_prom[i], 1.0)
+            A[i, i] = (d - 1.0) / d
+            A[i, i + 1] = 1.0 / d
+
+    A = A / A.sum(axis=1, keepdims=True)
+    return A, dur_prom
+
+
+def inicializar_pi_bakis(N):
+    pi = np.zeros(N, dtype=np.float64)
+    pi[0] = 1.0
+    return pi
+
+
+def entrenar_hmm_conteos_para_palabra(palabra, secuencias_O, N=5, M=256, epsilon=1e-6):
+    if len(secuencias_O) == 0:
+        raise ValueError(f"No hay secuencias O para palabra: {palabra}")
+
+    B, B_counts = estimar_B_por_conteos(secuencias_O, N=N, M=M, epsilon=epsilon)
+    A, dur_prom = estimar_A_por_duracion(secuencias_O, N=N)
+    pi = inicializar_pi_bakis(N)
+
+    # Verificaciones numéricas importantes
+    if not np.allclose(A.sum(axis=1), 1.0):
+        raise ValueError(f"Filas de A no suman 1 para {palabra}")
+    if not np.allclose(B.sum(axis=1), 1.0):
+        raise ValueError(f"Filas de B no suman 1 para {palabra}")
+    if not np.allclose(pi.sum(), 1.0):
+        raise ValueError(f"pi no suma 1 para {palabra}")
+
+    modelo = {
         "palabra": palabra,
-        "lsf": lsf_all,
-        "r": r_all,
-        "archivos_ok": archivos_ok,
-        "archivos_fallidos": archivos_fallidos
+        "N": int(N),
+        "M": int(M),
+        "epsilon_B": float(epsilon),
+        "A": A,
+        "B": B,
+        "B_counts": B_counts,
+        "pi": pi,
+        "duracion_promedio_estados": dur_prom,
+        "num_secuencias_entrenamiento": int(len(secuencias_O)),
+        "longitudes_secuencias": [int(len(O)) for O in secuencias_O]
     }
 
+    return modelo
 
-def guardar_modelo_palabra(palabra, modelo, carpeta_salida, codebook_size):
-    """
-    Guarda el modelo entrenado de una palabra.
 
-    Se almacenan:
-    - centroides en LSF,
-    - centroides en LPC,
-    - asignaciones,
-    - distancias,
-    - historial del entrenamiento.
-    """
+# =========================================================
+# GUARDADO
+# =========================================================
+
+def guardar_codebook(modelo_codebook, carpeta_salida):
     os.makedirs(carpeta_salida, exist_ok=True)
 
-    ruta_npz = os.path.join(carpeta_salida, f"{palabra}_codebook_{codebook_size}_is.npz")
-    ruta_json = os.path.join(carpeta_salida, f"{palabra}_historial_{codebook_size}_is.json")
+    ruta_npz = os.path.join(carpeta_salida, "codebook_mfcc_256.npz")
+    ruta_json = os.path.join(carpeta_salida, "codebook_mfcc_256_historial.json")
 
     np.savez(
         ruta_npz,
-        palabra=palabra,
-        orden_lpc=ORDEN_LPC,
-        codebook_size=codebook_size,
-        centroides_lsf=modelo["centroides_lsf"],
-        centroides_lpc=modelo["centroides_lpc"],
-        asignaciones=modelo["asignaciones"],
-        distancias=modelo["distancias"]
+        centroides=modelo_codebook["centroides"],
+        codebook_size=CODEBOOK_SIZE,
+        n_mfcc=N_MFCC,
+        n_fft=N_FFT,
+        n_filtros_mel=N_FILTROS_MEL,
+        distorsion_media=modelo_codebook["distorsion_media"]
     )
 
     with open(ruta_json, "w", encoding="utf-8") as f:
-        json.dump(modelo["historial"], f, indent=2, ensure_ascii=False)
+        json.dump(convertir_a_json_serializable(modelo_codebook["historial"]), f, indent=2, ensure_ascii=False)
 
     print(f"[GUARDADO] {ruta_npz}")
     print(f"[GUARDADO] {ruta_json}")
 
 
-def entrenar_codebook_por_palabra(
-    palabra,
-    orden_lpc=12,
-    codebook_size=16,
-    carpeta_salida="modelos_codebook_16_is"
-):
-    """
-    Entrena el codebook de una sola palabra.
+def guardar_secuencias(secuencias_por_palabra, metadata_secuencias, carpeta_salida):
+    os.makedirs(carpeta_salida, exist_ok=True)
 
-    Pasos:
-    1. carga todos los audios de entrenamiento,
-    2. extrae sus características,
-    3. entrena un modelo LBG-IS,
-    4. guarda el resultado.
-    """
-    datos = cargar_datos_entrenamiento_palabra(
+    ruta_npz = os.path.join(carpeta_salida, "secuencias_observacion_O.npz")
+    ruta_json = os.path.join(carpeta_salida, "secuencias_observacion_O_metadata.json")
+
+    arrays = {}
+    for palabra, secuencias in secuencias_por_palabra.items():
+        for i, O in enumerate(secuencias):
+            arrays[f"{palabra}_{i:03d}"] = np.asarray(O, dtype=np.int64)
+
+    np.savez(ruta_npz, **arrays)
+
+    with open(ruta_json, "w", encoding="utf-8") as f:
+        json.dump(convertir_a_json_serializable(metadata_secuencias), f, indent=2, ensure_ascii=False)
+
+    print(f"[GUARDADO] {ruta_npz}")
+    print(f"[GUARDADO] {ruta_json}")
+
+
+def guardar_modelo_hmm(modelo, carpeta_salida):
+    os.makedirs(carpeta_salida, exist_ok=True)
+    palabra = modelo["palabra"]
+
+    ruta_npz = os.path.join(carpeta_salida, f"hmm_{palabra}.npz")
+    ruta_json = os.path.join(carpeta_salida, f"hmm_{palabra}_resumen.json")
+
+    np.savez(
+        ruta_npz,
         palabra=palabra,
-        orden_lpc=orden_lpc,
-        alpha=ALPHA_PRENFASIS,
-        frame_length=FRAME_LENGTH,
-        hop_length=HOP_LENGTH,
-        energy_factor=ENERGY_FACTOR,
-        zcr_factor=ZCR_FACTOR,
-        margen_ms=MARGEN_MS
+        N=modelo["N"],
+        M=modelo["M"],
+        epsilon_B=modelo["epsilon_B"],
+        A=modelo["A"],
+        B=modelo["B"],
+        B_counts=modelo["B_counts"],
+        pi=modelo["pi"],
+        duracion_promedio_estados=modelo["duracion_promedio_estados"],
+        longitudes_secuencias=np.array(modelo["longitudes_secuencias"], dtype=np.int64)
     )
 
-    print(f"\nEntrenando LBG-IS monotónico para '{palabra}' con K={codebook_size} ...")
+    resumen = {
+        "palabra": modelo["palabra"],
+        "N": modelo["N"],
+        "M": modelo["M"],
+        "epsilon_B": modelo["epsilon_B"],
+        "num_secuencias_entrenamiento": modelo["num_secuencias_entrenamiento"],
+        "longitudes_secuencias": modelo["longitudes_secuencias"],
+        "duracion_promedio_estados": modelo["duracion_promedio_estados"],
+        "suma_filas_A": modelo["A"].sum(axis=1),
+        "suma_filas_B": modelo["B"].sum(axis=1),
+        "suma_pi": float(modelo["pi"].sum()),
+        "A": modelo["A"]
+    }
 
-    modelo = entrenar_lbg_is_monotono(
-        lsf_vectors=datos["lsf"],
-        r_vectors=datos["r"],
-        K_objetivo=codebook_size,
-        tol_rel=TOL_REL,
-        max_iter=MAX_ITER_LBG,
-        sigma2_mode="frame",
-        delta_split=DELTA_SPLIT,
+    with open(ruta_json, "w", encoding="utf-8") as f:
+        json.dump(convertir_a_json_serializable(resumen), f, indent=2, ensure_ascii=False)
+
+    print(f"[GUARDADO] {ruta_npz}")
+    print(f"[GUARDADO] {ruta_json}")
+
+
+# =========================================================
+# PIPELINE COMPLETO DE ENTRENAMIENTO
+# =========================================================
+
+def construir_secuencias_observacion(registros, centroides):
+    secuencias_por_palabra = {palabra: [] for palabra in PALABRAS}
+    metadata = []
+
+    print("\n====================================================")
+    print("CUANTIZACIÓN VECTORIAL: MFCC -> ÍNDICES 0..255")
+    print("====================================================")
+
+    for reg in registros:
+        palabra = reg["palabra"]
+        ruta = reg["ruta"]
+        mfcc = reg["mfcc"]
+
+        O = mfcc_a_indices_vq(mfcc, centroides)
+        secuencias_por_palabra[palabra].append(O)
+
+        metadata.append({
+            "palabra": palabra,
+            "ruta": ruta,
+            "num_frames_mfcc": int(mfcc.shape[0]),
+            "longitud_O": int(len(O)),
+            "min_O": int(np.min(O)),
+            "max_O": int(np.max(O)),
+            "primeros_20_indices": O[:20].tolist()
+        })
+
+        print(
+            f"[OK] {os.path.basename(ruta)} | palabra={palabra} | "
+            f"O_len={len(O)} | min={np.min(O)} | max={np.max(O)} | O[:10]={O[:10].tolist()}"
+        )
+
+    return secuencias_por_palabra, metadata
+
+
+def entrenar_todos_los_hmm(secuencias_por_palabra):
+    modelos_hmm = {}
+
+    print("\n====================================================")
+    print("ENTRENAMIENTO HMM POR INGENIERÍA DE CONTEOS")
+    print("====================================================")
+
+    for palabra in PALABRAS:
+        secuencias = secuencias_por_palabra.get(palabra, [])
+
+        try:
+            modelo = entrenar_hmm_conteos_para_palabra(
+                palabra=palabra,
+                secuencias_O=secuencias,
+                N=NUM_ESTADOS_HMM,
+                M=NUM_SIMBOLOS,
+                epsilon=EPSILON_B
+            )
+            modelos_hmm[palabra] = modelo
+
+            print(f"\n[OK] HMM entrenado: {palabra}")
+            print(f"  Secuencias      : {len(secuencias)}")
+            print(f"  A shape         : {modelo['A'].shape}")
+            print(f"  B shape         : {modelo['B'].shape}")
+            print(f"  pi shape        : {modelo['pi'].shape}")
+            print(f"  sum(A filas)    : {np.round(modelo['A'].sum(axis=1), 6)}")
+            print(f"  sum(B filas)    : {np.round(modelo['B'].sum(axis=1), 6)}")
+            print(f"  A:\n{np.round(modelo['A'], 4)}")
+
+        except Exception as e:
+            print(f"\n[ERROR] No se pudo entrenar HMM para '{palabra}': {e}")
+
+    return modelos_hmm
+
+
+def main():
+    os.makedirs(CARPETA_SALIDA, exist_ok=True)
+
+    print("====================================================")
+    print("ENTRENAMIENTO MFCC + VQ 256 + HMM BAKIS")
+    print("====================================================")
+    print(f"Palabras             : {PALABRAS}")
+    print(f"MFCC                 : {N_MFCC}")
+    print(f"Codebook global      : {CODEBOOK_SIZE}")
+    print(f"Estados HMM          : {NUM_ESTADOS_HMM}")
+    print(f"Símbolos HMM         : {NUM_SIMBOLOS}")
+    print(f"Salida               : {CARPETA_SALIDA}")
+    print("====================================================")
+
+    # 1. Extraer MFCC de todos los audios de train.
+    mfcc_global, registros, fallidos = recolectar_mfcc_entrenamiento()
+
+    # Guardar fallidos, si existen.
+    with open(os.path.join(CARPETA_SALIDA, "audios_fallidos.json"), "w", encoding="utf-8") as f:
+        json.dump(convertir_a_json_serializable(fallidos), f, indent=2, ensure_ascii=False)
+
+    # 2. Entrenar un único codebook global de 256 centroides.
+    print("\n====================================================")
+    print("ENTRENANDO CODEBOOK GLOBAL MFCC CON K-MEANS")
+    print("====================================================")
+    print(f"Matriz de entrenamiento: {mfcc_global.shape}")
+    print(f"K objetivo             : {CODEBOOK_SIZE}")
+
+    modelo_codebook = entrenar_codebook_kmeans(
+        X=mfcc_global,
+        K=CODEBOOK_SIZE,
+        max_iter=KMEANS_MAX_ITER,
+        tol=KMEANS_TOL,
+        seed=RANDOM_SEED,
         verbose=True
     )
 
-    guardar_modelo_palabra(palabra, modelo, carpeta_salida, codebook_size)
+    print(f"\n[OK] Codebook entrenado: {modelo_codebook['centroides'].shape}")
+    print(f"Distorsión media final: {modelo_codebook['distorsion_media']:.6f}")
+    guardar_codebook(modelo_codebook, CARPETA_SALIDA)
 
-    return modelo
+    # 3. Convertir cada audio a secuencia discreta O.
+    secuencias_por_palabra, metadata_secuencias = construir_secuencias_observacion(
+        registros=registros,
+        centroides=modelo_codebook["centroides"]
+    )
+    guardar_secuencias(secuencias_por_palabra, metadata_secuencias, CARPETA_SALIDA)
 
+    # 4. Entrenar un HMM por palabra usando conteos directos.
+    modelos_hmm = entrenar_todos_los_hmm(secuencias_por_palabra)
 
-def entrenar_tamano_codebook(codebook_size):
-    """
-    Entrena un conjunto completo de modelos para un tamaño de codebook dado.
+    carpeta_hmm = os.path.join(CARPETA_SALIDA, "hmm")
+    os.makedirs(carpeta_hmm, exist_ok=True)
 
-    Por ejemplo:
-    - entrena todos los modelos con K=16,
-    - luego con K=32,
-    - luego con K=64.
-    """
-    carpeta_modelos = f"modelos_codebook_{codebook_size}_is"
-    os.makedirs(carpeta_modelos, exist_ok=True)
+    for palabra, modelo in modelos_hmm.items():
+        guardar_modelo_hmm(modelo, carpeta_hmm)
+
+    # 5. Resumen general.
+    resumen_general = {
+        "palabras": PALABRAS,
+        "n_mfcc": N_MFCC,
+        "n_fft": N_FFT,
+        "n_filtros_mel": N_FILTROS_MEL,
+        "codebook_size": CODEBOOK_SIZE,
+        "num_estados_hmm": NUM_ESTADOS_HMM,
+        "num_simbolos": NUM_SIMBOLOS,
+        "epsilon_B": EPSILON_B,
+        "audios_validos": len(registros),
+        "audios_fallidos": len(fallidos),
+        "modelos_hmm_entrenados": list(modelos_hmm.keys()),
+        "carpeta_salida": CARPETA_SALIDA
+    }
+
+    with open(os.path.join(CARPETA_SALIDA, "resumen_entrenamiento.json"), "w", encoding="utf-8") as f:
+        json.dump(convertir_a_json_serializable(resumen_general), f, indent=2, ensure_ascii=False)
 
     print("\n====================================================")
-    print("ENTRENAMIENTO DE CODEBOOKS LBG-IS")
+    print("FIN DEL ENTRENAMIENTO")
     print("====================================================")
-    print(f"Orden LPC      : {ORDEN_LPC}")
-    print(f"Codevectors    : {codebook_size}")
-    print(f"Palabras       : {PALABRAS}")
-    print(f"Salida modelos : {carpeta_modelos}")
-    print("====================================================")
-
-    modelos = {}
-
-    for palabra in PALABRAS:
-        try:
-            modelo = entrenar_codebook_por_palabra(
-                palabra=palabra,
-                orden_lpc=ORDEN_LPC,
-                codebook_size=codebook_size,
-                carpeta_salida=carpeta_modelos
-            )
-            modelos[palabra] = modelo
-            print(f"\n[OK] Entrenamiento completado para '{palabra}' con K={codebook_size}\n")
-
-        except Exception as e:
-            print(f"\n[ERROR] No se pudo entrenar '{palabra}' con K={codebook_size}: {e}\n")
-
-    print("====================================================")
-    print(f"FIN DEL ENTRENAMIENTO PARA K={codebook_size}")
-    print("====================================================")
-
-    return modelos
+    print(f"Modelos entrenados: {list(modelos_hmm.keys())}")
+    print(f"Archivos guardados en: {CARPETA_SALIDA}")
+    print("\nSiguiente paso: implementar Forward en logaritmos usando A, B y pi.")
 
 
-# =========================================================
-# FUNCIÓN PRINCIPAL
-# =========================================================
-
-def main():
-    """
-    Ejecuta el entrenamiento completo del sistema.
-
-    Entrena codebooks para todos los tamaños definidos en CODEBOOK_SIZES
-    y para todas las palabras del conjunto.
-    """
-    print("====================================================")
-    print("ENTRENAMIENTO MULTIPLE DE CODEBOOKS LBG-IS")
-    print("====================================================")
-    print(f"Orden LPC         : {ORDEN_LPC}")
-    print(f"Tamaños codebook  : {CODEBOOK_SIZES}")
-    print(f"Palabras          : {PALABRAS}")
-    print("====================================================")
-
-    todos_los_modelos = {}
-
-    for codebook_size in CODEBOOK_SIZES:
-        modelos_k = entrenar_tamano_codebook(codebook_size)
-        todos_los_modelos[codebook_size] = modelos_k
-
-    print("====================================================")
-    print("FIN TOTAL DEL ENTRENAMIENTO")
-    print("====================================================")
-
-
-# Punto de entrada del script.
-# Esto hace que el entrenamiento se ejecute solo si el archivo
-# se corre directamente desde Python.
 if __name__ == "__main__":
     main()
