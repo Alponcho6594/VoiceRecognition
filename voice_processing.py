@@ -10,7 +10,16 @@ from scipy.fftpack import dct
 # =========================================================
 
 PALABRAS = [
-    "alto", "busca", "carga", "trailer", "arranca"
+    "arranca",
+    "almacen",
+    "base",
+    "recoge",
+    "suelo",
+    "mira",
+    "izquierda",
+    "grua",
+    "freno",
+    "entrega"
 ]
 
 # MFCC
@@ -386,7 +395,7 @@ def recolectar_mfcc_entrenamiento():
     print("====================================================")
 
     for palabra in PALABRAS:
-        patron = os.path.join(palabra, "train", "*.wav")
+        patron = os.path.join("train", palabra, "*.wav")
         rutas = sorted(glob.glob(patron))
 
         print(f"\nPalabra: {palabra}")

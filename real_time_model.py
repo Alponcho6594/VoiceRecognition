@@ -8,7 +8,16 @@ from scipy.fftpack import dct
 # =========================================================
 
 PALABRAS = [
-    "alto", "busca", "camion"
+    "arranca",
+    "almacen",
+    "base",
+    "recoge",
+    "suelo",
+    "mira",
+    "izquierda",
+    "grua",
+    "freno",
+    "entrega"
 ]
 
 # Deben coincidir con entrenamiento/test

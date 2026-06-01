@@ -1,0 +1,165 @@
+{
+  "accuracy": 97.33333333333334,
+  "correctos": 146,
+  "total": 150,
+  "palabras": [
+    "arranca",
+    "almacen",
+    "base",
+    "recoge",
+    "suelo",
+    "mira",
+    "izquierda",
+    "grua",
+    "freno",
+    "entrega"
+  ],
+  "tamano_matriz_confusion": "10x10",
+  "matriz_confusion": [
+    [
+      15,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      15,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      15,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      15,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      15,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      14,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      15,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      15,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      3,
+      0,
+      0,
+      0,
+      12,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      15
+    ]
+  ],
+  "analisis_confusiones": [
+    {
+      "real": "mira",
+      "predicha": "entrega",
+      "conteo": 1,
+      "total_real": 15,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "freno",
+      "predicha": "suelo",
+      "conteo": 3,
+      "total_real": 15,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    }
+  ],
+  "errores": [],
+  "archivo_matriz": "matriz_confusion_mfcc_hmm_forward.csv",
+  "archivo_reporte": "reporte_test_mfcc_hmm_forward.csv",
+  "archivo_verificacion_A": "verificacion_diagonalidad_A.csv",
+  "archivo_verificacion_B": "verificacion_sparsity_B_estado1.csv",
+  "archivo_verificacion_json": "verificacion_modelos_hmm.json",
+  "carpeta_modelos": "modelos_hmm_mfcc_vq",
+  "ruta_codebook": "modelos_hmm_mfcc_vq/codebook_mfcc_256.npz",
+  "carpeta_hmm": "modelos_hmm_mfcc_vq/hmm"
+}

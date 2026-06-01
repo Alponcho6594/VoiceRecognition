@@ -14,7 +14,16 @@ from scipy.fftpack import dct
 # Esta lista debe coincidir exactamente con las palabras usadas en entrenamiento.
 # Si tu proyecto es de 5 palabras, la matriz de confusión será 5x5.
 PALABRAS = [
-    "alto", "busca", "carga", "trailer", "arranca"
+    "arranca",
+    "almacen",
+    "base",
+    "recoge",
+    "suelo",
+    "mira",
+    "izquierda",
+    "grua",
+    "freno",
+    "entrega"
 ]
 
 # Deben coincidir con el entrenamiento
@@ -753,7 +762,7 @@ def probar_modelo():
     correctos = 0
 
     for i_real, palabra_real in enumerate(PALABRAS):
-        rutas_test = sorted(glob.glob(os.path.join(palabra_real, "test", "*.wav")))
+        rutas_test = sorted(glob.glob(os.path.join("test", palabra_real, "*.wav")))
 
         print("\n----------------------------------------------------")
         print(f"Evaluando palabra real: {palabra_real}")

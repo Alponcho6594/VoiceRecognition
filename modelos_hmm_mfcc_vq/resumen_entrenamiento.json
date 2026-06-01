@@ -1,0 +1,36 @@
+{
+  "palabras": [
+    "arranca",
+    "almacen",
+    "base",
+    "recoge",
+    "suelo",
+    "mira",
+    "izquierda",
+    "grua",
+    "freno",
+    "entrega"
+  ],
+  "n_mfcc": 13,
+  "n_fft": 512,
+  "n_filtros_mel": 26,
+  "codebook_size": 256,
+  "num_estados_hmm": 5,
+  "num_simbolos": 256,
+  "epsilon_B": 1e-06,
+  "audios_validos": 300,
+  "audios_fallidos": 0,
+  "modelos_hmm_entrenados": [
+    "arranca",
+    "almacen",
+    "base",
+    "recoge",
+    "suelo",
+    "mira",
+    "izquierda",
+    "grua",
+    "freno",
+    "entrega"
+  ],
+  "carpeta_salida": "modelos_hmm_mfcc_vq"
+}
