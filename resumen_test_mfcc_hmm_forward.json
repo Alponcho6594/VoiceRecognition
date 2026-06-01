@@ -1,7 +1,7 @@
 {
-  "accuracy": 97.33333333333334,
-  "correctos": 146,
-  "total": 150,
+  "accuracy": 93.0,
+  "correctos": 186,
+  "total": 200,
   "palabras": [
     "arranca",
     "almacen",
@@ -17,20 +17,8 @@
   "tamano_matriz_confusion": "10x10",
   "matriz_confusion": [
     [
-      15,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-    ],
-    [
-      0,
-      15,
+      19,
+      1,
       0,
       0,
       0,
@@ -42,8 +30,20 @@
     ],
     [
       0,
+      20,
       0,
-      15,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      20,
       0,
       0,
       0,
@@ -56,7 +56,7 @@
       0,
       0,
       0,
-      15,
+      20,
       0,
       0,
       0,
@@ -65,16 +65,16 @@
       0
     ],
     [
+      1,
       0,
       0,
       0,
+      16,
       0,
-      15,
+      2,
       0,
       0,
-      0,
-      0,
-      0
+      1
     ],
     [
       0,
@@ -82,7 +82,7 @@
       0,
       0,
       0,
-      14,
+      19,
       0,
       0,
       0,
@@ -95,7 +95,7 @@
       0,
       0,
       0,
-      15,
+      20,
       0,
       0,
       0
@@ -103,26 +103,26 @@
     [
       0,
       0,
+      1,
       0,
       0,
       0,
       0,
-      0,
-      15,
+      19,
       0,
       0
     ],
     [
       0,
       0,
+      0,
+      1,
       0,
       0,
       3,
       0,
-      0,
-      0,
-      12,
-      0
+      15,
+      1
     ],
     [
       0,
@@ -130,26 +130,82 @@
       0,
       0,
       0,
+      2,
       0,
       0,
       0,
-      0,
-      15
+      18
     ]
   ],
   "analisis_confusiones": [
     {
+      "real": "arranca",
+      "predicha": "almacen",
+      "conteo": 1,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "suelo",
+      "predicha": "arranca",
+      "conteo": 1,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "suelo",
+      "predicha": "izquierda",
+      "conteo": 2,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "suelo",
+      "predicha": "entrega",
+      "conteo": 1,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
       "real": "mira",
       "predicha": "entrega",
       "conteo": 1,
-      "total_real": 15,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "grua",
+      "predicha": "base",
+      "conteo": 1,
+      "total_real": 20,
       "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
     },
     {
       "real": "freno",
-      "predicha": "suelo",
+      "predicha": "recoge",
+      "conteo": 1,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "freno",
+      "predicha": "izquierda",
       "conteo": 3,
-      "total_real": 15,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "freno",
+      "predicha": "entrega",
+      "conteo": 1,
+      "total_real": 20,
+      "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
+    },
+    {
+      "real": "entrega",
+      "predicha": "mira",
+      "conteo": 2,
+      "total_real": 20,
       "comentario": "Revisar si hay similitud fonética entre estas palabras o si el codebook VQ está asignando índices parecidos a regiones acústicas distintas."
     }
   ],

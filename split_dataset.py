@@ -33,10 +33,10 @@ for folder_name in folders:
 
     files = sorted([f for f in source_dir.iterdir() if f.is_file()])
 
-    if len(files) != 45:
+    if len(files) != 60:
         print(f"WARNING: {folder_name} tiene {len(files)} archivos, no 45")
 
-    for start in [0, 15, 30]:
+    for start in [0, 15, 30, 45]:
         group = files[start:start + 15]
         random.shuffle(group)
 

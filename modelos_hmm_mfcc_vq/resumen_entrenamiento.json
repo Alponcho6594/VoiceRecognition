@@ -18,7 +18,7 @@
   "num_estados_hmm": 5,
   "num_simbolos": 256,
   "epsilon_B": 1e-06,
-  "audios_validos": 300,
+  "audios_validos": 400,
   "audios_fallidos": 0,
   "modelos_hmm_entrenados": [
     "arranca",
